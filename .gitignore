@@ -1,0 +1,14 @@
+# 构建产物
+VibeHub.app/
+dist/
+
+# 图标生成中间产物
+AppIcon.iconset/
+make-icon
+
+# macOS
+.DS_Store
+
+# Xcode 用户数据
+*.xcuserstate
+*.xcuserdatad/
