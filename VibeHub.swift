@@ -858,6 +858,29 @@ final class LaunchAtLogin: ObservableObject {
 
 // MARK: - UI: 共享单行编辑器（AirPods + Remote 都用）
 
+/// 懒加载的按键选择器：用 Menu 替代 Picker —— Menu 的 ForEach 子项只在用户点开下拉时才构建，
+/// 折叠状态只有一个 label 在视图树里。把首次 popover 打开的 SwiftUI body 评估成本降一个量级。
+struct LazyKeyMenu: View {
+    @Binding var selection: String
+    let enabled: Bool
+
+    private var currentLabel: String { keyChoice(selection)?.label ?? "?" }
+
+    var body: some View {
+        Menu {
+            ForEach(keyChoices) { c in
+                Button(c.label) { selection = c.id }
+            }
+        } label: {
+            Text(currentLabel)
+                .font(.system(size: 12))
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .controlSize(.small)
+        .disabled(!enabled)
+    }
+}
+
 struct KeyPickerRow: View {
     let label: String
     let labelWidth: CGFloat
@@ -880,18 +903,15 @@ struct KeyPickerRow: View {
                 Toggle("", isOn: $mapping.enabled).labelsHidden()
                 Text(label).frame(width: labelWidth, alignment: .leading).font(.system(size: 12))
 
-                Picker("", selection: firstKeyBinding) {
-                    ForEach(keyChoices) { c in Text(c.label).tag(c.id) }
-                }
-                .labelsHidden().frame(maxWidth: .infinity).disabled(!mapping.enabled)
-                .controlSize(.small)
+                LazyKeyMenu(selection: firstKeyBinding, enabled: mapping.enabled)
+                    .frame(maxWidth: .infinity)
 
                 if showModePicker {
                     Picker("", selection: $mapping.mode) {
                         Text("点按").tag(MappingMode.tap)
                         Text("按住").tag(MappingMode.holdToggle)
                     }
-                    .pickerStyle(.segmented).labelsHidden().frame(width: 88)
+                    .pickerStyle(.segmented).labelsHidden().frame(width: 72)
                     .disabled(!mapping.enabled).controlSize(.small)
                 }
 
@@ -901,19 +921,15 @@ struct KeyPickerRow: View {
                 .buttonStyle(.borderless).help("追加 chord 按键").disabled(!mapping.enabled)
             }
 
-            // chord 第 2..N 个按键往下排
             if mapping.keys.count > 1 {
                 ForEach(1..<mapping.keys.count, id: \.self) { idx in
                     HStack(spacing: 6) {
                         Spacer().frame(width: labelWidth + 24)
                         Image(systemName: "plus").foregroundColor(.secondary).font(.system(size: 9))
-                        Picker("", selection: Binding(
+                        LazyKeyMenu(selection: Binding(
                             get: { idx < mapping.keys.count ? mapping.keys[idx] : "lopt" },
                             set: { v in if idx < mapping.keys.count { mapping.keys[idx] = v } }
-                        )) {
-                            ForEach(keyChoices) { c in Text(c.label).tag(c.id) }
-                        }
-                        .labelsHidden().frame(maxWidth: .infinity).controlSize(.small)
+                        ), enabled: mapping.enabled).frame(maxWidth: .infinity)
                         Button {
                             if idx < mapping.keys.count { mapping.keys.remove(at: idx) }
                         } label: { Image(systemName: "minus.circle") }
@@ -1018,6 +1034,13 @@ struct RemoteTabView: View {
     private let groupSystem = ["home", "back", "voice"]
     private let groupVolume = ["mute", "volup", "voldn"]
 
+    private func scanDevicesAsync() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = enumerateRemoteCandidates()
+            DispatchQueue.main.async { self.detectedDevices = result }
+        }
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 8) {
@@ -1093,7 +1116,7 @@ struct RemoteTabView: View {
     private func mappingRow(for id: String) -> some View {
         Group {
             if let b = remoteButtons.first(where: { $0.id == id }) {
-                KeyPickerRow(label: b.label, labelWidth: 78,
+                KeyPickerRow(label: b.label, labelWidth: 68,
                     mapping: config.binding(for: id), showModePicker: false)
             }
         }
@@ -1121,7 +1144,7 @@ struct RemoteTabView: View {
                         }
                     }
                     Divider()
-                    Button("重新扫描") { detectedDevices = enumerateRemoteCandidates() }
+                    Button("重新扫描") { scanDevicesAsync() }
                     Button("恢复默认 (XING WEI 0x1915:0x1025)") {
                         config.targetVID = DEFAULT_TARGET_VID
                         config.targetPID = DEFAULT_TARGET_PID
@@ -1134,7 +1157,7 @@ struct RemoteTabView: View {
                     }
                 }
                 .menuStyle(.borderlessButton).fixedSize()
-                .onAppear { detectedDevices = enumerateRemoteCandidates() }
+                .onAppear { if detectedDevices.isEmpty { scanDevicesAsync() } }
             }
             Text(currentDeviceLabel)
                 .font(.system(size: 11, design: .monospaced))
@@ -1184,22 +1207,38 @@ struct RemoteTabView: View {
     }
 }
 
-// MARK: - UI: 主面板（TabView 容器）
+// MARK: - UI: 主面板（segmented picker + ZStack，Tab 切换不重建视图树）
 
 struct ContentView: View {
     @ObservedObject var loginItem = LaunchAtLogin.shared
+    @State private var selectedTab: String = "airpods"
 
     var body: some View {
         VStack(spacing: 0) {
-            TabView {
-                AirPodsTabView()
-                    .tabItem { Label("AirPods", systemImage: "earbuds") }
-                RemoteTabView()
-                    .tabItem { Label("Remote", systemImage: "av.remote") }
+            Picker("", selection: $selectedTab) {
+                Text("AirPods").tag("airpods")
+                Text("Remote").tag("remote")
             }
-            .frame(width: 480, height: 540)
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(.horizontal, 10)
+            .padding(.top, 8)
+            .padding(.bottom, 6)
 
             Divider()
+
+            ZStack(alignment: .top) {
+                AirPodsTabView()
+                    .opacity(selectedTab == "airpods" ? 1 : 0)
+                    .allowsHitTesting(selectedTab == "airpods")
+                RemoteTabView()
+                    .opacity(selectedTab == "remote" ? 1 : 0)
+                    .allowsHitTesting(selectedTab == "remote")
+            }
+            .frame(width: 340, height: 620)
+
+            Divider()
+
             HStack(spacing: 8) {
                 Toggle(isOn: Binding(
                     get: { loginItem.isEnabled },
@@ -1207,20 +1246,25 @@ struct ContentView: View {
                 )) { Text("开机自启").font(.caption) }
                 .toggleStyle(.checkbox)
                 Spacer()
-                Button("退出 VibeHub") { NSApp.terminate(nil) }
-                    .buttonStyle(.borderless).font(.caption)
-                    .keyboardShortcut("q")
+                Button {
+                    NSApp.terminate(nil)
+                } label: {
+                    Text("退出 VibeHub").font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .keyboardShortcut("q")
             }
-            .padding(.horizontal, 12).padding(.vertical, 8)
+            .padding(.horizontal, 10).padding(.vertical, 6)
 
             if let err = loginItem.lastError {
                 Text("自启动设置失败：\(err)")
                     .font(.caption2).foregroundColor(.orange)
-                    .padding(.horizontal, 12).padding(.bottom, 6)
+                    .padding(.horizontal, 10).padding(.bottom, 6)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .frame(width: 480)
+        .frame(width: 340)
+        .background(Color(NSColor.windowBackgroundColor))
     }
 }
 
@@ -1245,7 +1289,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             applyStatusIcon(to: button)
             button.target = self
             button.action = #selector(handleStatusClick(_:))
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            // 左键改成 mouseDown 触发：默认 mouseUp 要等用户松开手才响应，
+            // 即便后续都是 0ms，用户也会觉得"按下后停顿了一下"。
+            button.sendAction(on: [.leftMouseDown, .rightMouseUp])
         }
         updateIconAppearance()
 
@@ -1265,7 +1311,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         popover = NSPopover()
         popover.behavior = .transient
-        popover.contentViewController = NSHostingController(rootView: ContentView())
+        popover.animates = false  // 关掉默认 ~200ms 弹出动画，状态栏点击立即响应
+
+        // 预热：先把 host 挂到一个屏外隐藏 window 里强制 SwiftUI 渲染整棵树，
+        // 然后再交给 popover。否则 SwiftUI 只在视图真正进入 window 时才 build body，
+        // 首次点击图标时要现场建整棵树。
+        let host = NSHostingController(rootView: ContentView())
+        let warmup = NSWindow(
+            contentRect: NSRect(x: -50000, y: -50000, width: 340, height: 720),
+            styleMask: [.borderless], backing: .buffered, defer: false)
+        warmup.alphaValue = 0
+        warmup.contentViewController = host
+        warmup.orderFront(nil)
+        host.view.layoutSubtreeIfNeeded()
+        DispatchQueue.main.async {
+            warmup.contentViewController = nil
+            warmup.orderOut(nil)
+            self.popover.contentViewController = host
+        }
     }
 
     private func applyStatusIcon(to button: NSStatusBarButton) {
@@ -1307,7 +1370,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popover.performClose(sender)
         } else {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            popover.contentViewController?.view.window?.makeKey()
         }
     }
 
