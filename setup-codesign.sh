@@ -6,6 +6,14 @@
 
 set -euo pipefail
 
+# macOS 自带的是 LibreSSL，不支持 -legacy/-macalg SHA1；优先用 Homebrew openssl@3
+OPENSSL="/opt/homebrew/opt/openssl@3/bin/openssl"
+[[ -x "$OPENSSL" ]] || OPENSSL="openssl"
+if ! "$OPENSSL" version | grep -q "^OpenSSL 3"; then
+    echo "❌ 需要 OpenSSL 3（系统 LibreSSL 不支持 -legacy）。请先: brew install openssl@3"
+    exit 1
+fi
+
 CN="${1:-VibeHub Self-Signed}"
 KEYCHAIN="${HOME}/Library/Keychains/login.keychain-db"
 DAYS=3650
@@ -32,7 +40,7 @@ extendedKeyUsage = critical, codeSigning
 basicConstraints = critical, CA:false
 EOF
 
-openssl req -new -x509 -days "$DAYS" -nodes \
+"$OPENSSL" req -new -x509 -days "$DAYS" -nodes \
     -newkey rsa:2048 \
     -keyout "$TMP_DIR/cert.key" \
     -out "$TMP_DIR/cert.crt" \
@@ -42,7 +50,7 @@ openssl req -new -x509 -days "$DAYS" -nodes \
 
 echo "→ 打包成 PKCS#12（legacy 模式 + SHA1 MAC 兼容 macOS Security framework）…"
 PASS="tmp"
-openssl pkcs12 -export -legacy \
+"$OPENSSL" pkcs12 -export -legacy \
     -macalg SHA1 \
     -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES \
     -inkey "$TMP_DIR/cert.key" \

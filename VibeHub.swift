@@ -135,9 +135,10 @@ private let NX_KEYTYPE_SOUND_DOWN: Int32 = 1
 private let NX_KEYTYPE_MUTE:       Int32 = 7
 private let NX_KEYTYPE_PLAY:       Int32 = 16
 private let NX_KEYTYPE_NEXT:       Int32 = 17
-// AirPods 三击实测发的是 keyCode 19（IOKit 头里这个值其实是 NX_KEYTYPE_FAST，
-// 而 NX_KEYTYPE_PREVIOUS=18）。非 Apple 耳机的"上一曲"按钮多数发 18，目前不处理。
-private let NX_KEYTYPE_PREVIOUS:   Int32 = 19
+// AirPods 三击实测发的是 keyCode 19（NX_KEYTYPE_FAST）；非 Apple 耳机的"上一曲"
+// 按钮多数发 18（真正的 NX_KEYTYPE_PREVIOUS）。两者都映射到"三击"。
+private let NX_KEYTYPE_FAST:       Int32 = 19
+private let NX_KEYTYPE_PREVIOUS:   Int32 = 18
 
 // MARK: - 共享：自家事件 magic（让 tap 识别自己 post 的事件，避免自吞）
 
@@ -277,6 +278,10 @@ final class AirPodsConfig: ObservableObject {
         if let data = try? JSONEncoder().encode(dict) {
             UserDefaults.standard.set(data, forKey: storeKey)
         }
+        // 用户关掉某行 / 切走 holdToggle 时，释放对应还按着的 hold（init 里直接赋值不触发 didSet，安全）。
+        DispatchQueue.main.async {
+            AirPodsTap.shared.releaseHoldsForDisabledMappings()
+        }
     }
 
     func resetToDefaults() {
@@ -372,10 +377,19 @@ final class AirPodsTap: ObservableObject {
         switch keyCode {
         case NX_KEYTYPE_PLAY:       mapping = cfg.single
         case NX_KEYTYPE_NEXT:       mapping = cfg.double
-        case NX_KEYTYPE_PREVIOUS:   mapping = cfg.triple
+        case NX_KEYTYPE_FAST, NX_KEYTYPE_PREVIOUS: mapping = cfg.triple
         case NX_KEYTYPE_SOUND_UP:   mapping = cfg.volumeUp
         case NX_KEYTYPE_SOUND_DOWN: mapping = cfg.volumeDown
         default: return Unmanaged.passUnretained(event)
+        }
+        // 已按住的 chord 无论映射当前是否 enabled，再按都能释放（否则 UI 关掉该行后 chord 永久卡住）。
+        if isKeyDown, let chord = holdingChords[keyCode] {
+            postChordUpSync(keyIds: chord)
+            holdingChords.removeValue(forKey: keyCode)
+            DispatchQueue.main.async { [weak self] in
+                self?.holdingCount = self?.holdingChords.count ?? 0
+            }
+            return nil
         }
         guard mapping.enabled, !mapping.keys.isEmpty else {
             return Unmanaged.passUnretained(event)
@@ -406,6 +420,30 @@ final class AirPodsTap: ObservableObject {
         for (_, chord) in holdingChords { postChordUpSync(keyIds: chord) }
         holdingChords.removeAll()
         DispatchQueue.main.async { [weak self] in self?.holdingCount = 0 }
+    }
+
+    /// 释放那些对应映射已被 disable 或不再是 holdToggle 的 hold，防止 chord 永久卡住。
+    /// 在 AirPodsConfig.save() 里调用（用户在 UI 关掉某行时）。只在主线程访问 holdingChords。
+    func releaseHoldsForDisabledMappings() {
+        let cfg = AirPodsConfig.shared
+        for (keyCode, chord) in holdingChords {
+            let mapping: Mapping
+            switch keyCode {
+            case NX_KEYTYPE_PLAY:       mapping = cfg.single
+            case NX_KEYTYPE_NEXT:       mapping = cfg.double
+            case NX_KEYTYPE_FAST, NX_KEYTYPE_PREVIOUS: mapping = cfg.triple
+            case NX_KEYTYPE_SOUND_UP:   mapping = cfg.volumeUp
+            case NX_KEYTYPE_SOUND_DOWN: mapping = cfg.volumeDown
+            default: continue
+            }
+            if !mapping.enabled || mapping.mode != .holdToggle {
+                postChordUpSync(keyIds: chord)
+                holdingChords.removeValue(forKey: keyCode)
+            }
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.holdingCount = self?.holdingChords.count ?? 0
+        }
     }
 }
 
@@ -758,6 +796,12 @@ final class RemoteEngine: ObservableObject {
 
     private func onDeviceRemoved(_ device: IOHIDDevice) {
         openedDevices.remove(device)
+        // 接收器被拔掉时 key-up 永远不来，repeat Timer 会无限发 chord。HID 回调在主
+        // runloop，repeatTimers 只在主线程访问，直接停掉所有 auto-repeat。
+        stopAllAutoRepeats()
+        // 同理：isDown 时加进 swallowSet 的条目等不到 key-up 的延迟摘除，
+        // 不清掉会永久吞真实键盘的同键码事件（与 stop() 的配对做法一致）。
+        clearSwallows()
         DispatchQueue.main.async { [weak self] in
             self?.deviceConnected = !(self?.openedDevices.isEmpty ?? true)
         }
@@ -1309,6 +1353,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil, queue: .main
         ) { [weak self] _ in self?.updateIconAppearance() }
 
+        // 锁屏/睡眠时释放所有 hold，否则 Opt 等修饰键会卡在按下状态，解锁输密码全错。
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification, object: nil, queue: .main
+        ) { _ in AirPodsTap.shared.releaseAllHeld() }
+        DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main
+        ) { _ in AirPodsTap.shared.releaseAllHeld() }
+
         popover = NSPopover()
         popover.behavior = .transient
         popover.animates = false  // 关掉默认 ~200ms 弹出动画，状态栏点击立即响应
@@ -1498,6 +1550,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         LaunchAtLogin.shared.setEnabled(!LaunchAtLogin.shared.isEnabled)
     }
     @objc private func menuAbout() {
+        let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "dev"
         let alert = NSAlert()
         alert.messageText = "VibeHub"
         alert.informativeText = """
@@ -1506,7 +1559,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             • 左键状态栏图标 → 配置面板（AirPods / Remote 两个 Tab）
             • 右键状态栏图标 → 快捷菜单
 
-            版本 1.0.0
+            版本 \(version)
             """
         alert.runModal()
     }

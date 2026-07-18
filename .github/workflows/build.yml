@@ -1,0 +1,29 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compile (unsigned)
+        run: |
+          swiftc -O -parse-as-library \
+            -target arm64-apple-macos13.0 \
+            -framework Cocoa -framework SwiftUI -framework CoreGraphics \
+            -framework ServiceManagement -framework IOKit \
+            VibeHub.swift \
+            -o VibeHub
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: VibeHub-binary
+          path: VibeHub

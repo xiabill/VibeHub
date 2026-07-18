@@ -35,7 +35,7 @@
 | AirPods Max | ✅ 全部工作 | 同普通版 |
 | AirPods Pro 1 | ⚠️ 待测试 | 理论上和普通版一样 |
 | **AirPods Pro 2 / Pro 3** | ❌ **不支持**（实测） | Apple 把 Pro 2 的 stem 事件**全部**路由到 MediaRemote 私有 IPC，包括音量+/- 也拦不到。所有同类工具（Karabiner-Elements、SiriMote 等）一样失效 |
-| 其他蓝牙耳机（非 Apple，各芯片厂商） | ✅ 部分手势可用 | Play/Pause 和音量+/- 全芯片通用；"下一曲"多数可用；"上一曲"多数拦不到（详见下） |
+| 其他蓝牙耳机（非 Apple，各芯片厂商） | ✅ 部分手势可用 | Play/Pause 和音量+/- 全芯片通用；"下一曲""上一曲"多数可用（详见下） |
 
 #### 非 Apple 耳机的逐手势支持
 
@@ -46,7 +46,7 @@
 | 单击 = Play/Pause | ✅ 全芯片可用 | AVRCP `PLAY/PAUSE` → `NX_KEYTYPE_PLAY (16)` |
 | 音量+ / 音量- | ✅ 全芯片可用 | AVRCP `VOL_UP/DOWN` → `NX_KEYTYPE_SOUND_UP/DOWN (0/1)` |
 | 双击 = 下一曲 | ✅ 大部分可用 | AVRCP `TRACK_NEXT` → `NX_KEYTYPE_NEXT (17)` |
-| 三击 = 上一曲 | ⚠️ 多数拦不到 | AirPods 三击发的是 `NX_KEYTYPE_FAST (19)`；非 Apple 耳机的"上一曲"按钮通常发 `NX_KEYTYPE_PREVIOUS (18)`。当前版本只识别 19 |
+| 三击 = 上一曲 | ✅ 大部分可用 | AirPods 三击发 `NX_KEYTYPE_FAST (19)`；非 Apple 耳机的"上一曲"按钮通常发 `NX_KEYTYPE_PREVIOUS (18)`。两者都识别，统一映射到「三击」 |
 
 ### Remote 模块
 
@@ -161,7 +161,7 @@ macOS 的 TCC（权限数据库）用 app 的 **designated requirement** 作为�
 
 ## 工作原理
 
-`VibeHub.swift`（单文件，~1100 行 Swift / SwiftUI / Cocoa）
+`VibeHub.swift`（单文件，~1590 行 Swift / SwiftUI / Cocoa）
 
 ### 共享层
 
@@ -219,7 +219,6 @@ CGEvent.post 出去 + sourceUserData 写 VH_EVENT_MAGIC（让 tap 不吞自己�
 ### AirPods 模块
 
 - **AirPods Pro 2 / Pro 3 完全不支持**（stem 事件走 MediaRemote 私有 IPC，所有同类工具都失效）
-- **三击在非 Apple 耳机上多数收不到**（AirPods 发 keyCode 19，其他耳机发 18）
 - **长按 stem（Siri / 降噪切换）拦不到**（系统专用路由）
 
 ### Remote 模块
@@ -238,7 +237,7 @@ CGEvent.post 出去 + sourceUserData 写 VH_EVENT_MAGIC（让 tap 不吞自己�
 
 ```
 .
-├── VibeHub.swift          # 单文件源码（~1100 行）
+├── VibeHub.swift          # 单文件源码（~1590 行）
 ├── probe.swift            # HID 事件探测器（加新硬件时用）
 ├── make-icon.swift        # 程序图标生成器（青蓝渐变 ⌘）
 ├── setup-codesign.sh      # 一次性创建 self-signed 证书

@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 APP_NAME="VibeHub"
 APP_BUNDLE="${APP_NAME}.app"
 BUNDLE_ID="com.xiabill.VibeHub"
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # 1. 生成图标（不存在时）
 if [[ ! -f AppIcon.icns ]]; then
@@ -22,13 +22,20 @@ mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 
 # 3. 编译（arm64；本机 M 芯片用。需要 universal 时加 x86_64 lipo）
-echo "→ 编译 arm64…"
-swiftc -O -parse-as-library \
-  -target arm64-apple-macos13.0 \
-  -framework Cocoa -framework SwiftUI -framework CoreGraphics \
-  -framework ServiceManagement -framework IOKit \
-  VibeHub.swift \
-  -o "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+#    若设置 PREBUILT_BINARY 且文件存在，则跳过编译，直接用现成二进制（CI 产物本地签名用）
+if [[ -n "${PREBUILT_BINARY:-}" && -f "$PREBUILT_BINARY" ]]; then
+  echo "→ 使用现成二进制（跳过编译）: $PREBUILT_BINARY"
+  cp "$PREBUILT_BINARY" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+  chmod +x "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+else
+  echo "→ 编译 arm64…"
+  swiftc -O -parse-as-library \
+    -target arm64-apple-macos13.0 \
+    -framework Cocoa -framework SwiftUI -framework CoreGraphics \
+    -framework ServiceManagement -framework IOKit \
+    VibeHub.swift \
+    -o "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+fi
 
 file "$APP_BUNDLE/Contents/MacOS/$APP_NAME" | sed 's/^/   /'
 
