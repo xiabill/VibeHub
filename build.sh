@@ -82,7 +82,7 @@ pick_signing_identity() {
 }
 
 if IDENT=$(pick_signing_identity); then
-    echo "→ 用 self-signed 证书签名（$IDENT）…"
+    echo "→ 用 self-signed 证书签名（${IDENT}）…"
     codesign --force --deep --sign "$IDENT" "$APP_BUNDLE" >/dev/null
 else
     echo "→ ad-hoc 签名（重编后 TCC 权限会丢失。建议跑 ./setup-codesign.sh 创建稳定证书）…"

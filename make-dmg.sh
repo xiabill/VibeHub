@@ -11,7 +11,7 @@ DMG_PATH="${DIST_DIR}/${APP_NAME}-${VERSION}.dmg"
 STAGING="${DIST_DIR}/.dmg-staging"
 
 if [[ ! -d "$APP_BUNDLE" ]]; then
-  echo "未找到 $APP_BUNDLE，先跑 ./build.sh"
+  echo "未找到 ${APP_BUNDLE}，先跑 ./build.sh"
   exit 1
 fi
 

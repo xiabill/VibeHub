@@ -19,7 +19,7 @@ DMG_PATH="dist/${APP_NAME}-${VERSION}.dmg"
 # 1. 校验 build.sh 里的 VERSION 与参数一致
 BUILD_VERSION=$(grep -E '^VERSION=' build.sh | head -1 | sed -E 's/^VERSION="?([^"]*)"?/\1/')
 if [[ "$BUILD_VERSION" != "$VERSION" ]]; then
-  echo "❌ 版本不一致：build.sh VERSION=$BUILD_VERSION，参数=$VERSION。请先同步 build.sh / make-dmg.sh 的版本号。" >&2
+  echo "❌ 版本不一致：build.sh VERSION=${BUILD_VERSION}，参数=${VERSION}。请先同步 build.sh / make-dmg.sh 的版本号。" >&2
   exit 1
 fi
 echo "→ 版本校验通过：$VERSION"
@@ -32,7 +32,7 @@ if [[ -z "$RUN_ID" || "$RUN_ID" == "null" ]]; then
   echo "❌ 未找到 tag $TAG 的成功构建 run。确认已 push tag 且 CI 已跑成功。" >&2
   exit 1
 fi
-echo "→ 找到 run: $RUN_ID，下载产物…"
+echo "→ 找到 run: ${RUN_ID}，下载产物…"
 rm -rf "$ARTIFACT_DIR"
 gh run download "$RUN_ID" -n VibeHub-binary -D "$ARTIFACT_DIR"
 if [[ ! -f "$ARTIFACT_DIR/VibeHub" ]]; then
@@ -68,7 +68,7 @@ NOTES="VibeHub v${VERSION}
 由 GitHub Actions 编译未签名二进制，本机 self-signed 证书签名打包。
 安装：双击 DMG，拖 VibeHub.app 到 Applications。"
 
-echo "→ 发布 GitHub Release $TAG…"
+echo "→ 发布 GitHub Release ${TAG}…"
 if gh release view "$TAG" >/dev/null 2>&1; then
   echo "→ Release $TAG 已存在，覆盖上传 DMG…"
   gh release upload "$TAG" "$DMG_PATH" --clobber
