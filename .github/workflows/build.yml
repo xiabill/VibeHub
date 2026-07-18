@@ -8,10 +8,15 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Xcode / actool version
+        run: |
+          xcodebuild -version
+          xcrun actool --version | head -5
 
       - name: Compile (unsigned)
         run: |
@@ -22,8 +27,35 @@ jobs:
             VibeHub.swift \
             -o VibeHub
 
-      - name: Upload binary
+      - name: Compile icon (AppIcon.icon -> Assets.car)
+        run: |
+          mkdir -p iconbuild
+          xcrun actool AppIcon.icon \
+            --compile iconbuild \
+            --app-icon AppIcon \
+            --include-all-app-icons \
+            --enable-on-demand-resources NO \
+            --development-region en \
+            --target-device mac \
+            --platform macosx \
+            --minimum-deployment-target 13.0 \
+            --output-partial-info-plist iconbuild/partial.plist \
+            --output-format human-readable-text \
+            --notices --warnings --errors
+          echo "=== iconbuild contents ==="
+          ls -la iconbuild
+          echo "=== assetutil --info Assets.car ==="
+          assetutil --info iconbuild/Assets.car || true
+
+      - name: Stage artifact (binary + Assets.car)
+        run: |
+          mkdir -p out
+          cp VibeHub out/VibeHub
+          cp iconbuild/Assets.car out/Assets.car
+          ls -la out
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: VibeHub-binary
-          path: VibeHub
+          path: out

@@ -43,6 +43,15 @@ if [[ -f AppIcon.icns ]]; then
   cp AppIcon.icns "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
 fi
 
+# 3b. macOS 26+ 分层图标：CI 用 actool 编好的 Assets.car（含浅/深变体）。
+#     本机无 Xcode/actool，走 icns 兜底；有 PREBUILT_ASSETS_CAR 才启用 CFBundleIconName。
+ICON_NAME_KEY=""
+if [[ -n "${PREBUILT_ASSETS_CAR:-}" && -f "$PREBUILT_ASSETS_CAR" ]]; then
+  echo "→ 放入 Assets.car（macOS 26 深色/浅色图标）"
+  cp "$PREBUILT_ASSETS_CAR" "$APP_BUNDLE/Contents/Resources/Assets.car"
+  ICON_NAME_KEY='  <key>CFBundleIconName</key><string>AppIcon</string>'
+fi
+
 # 4. Info.plist
 cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -57,6 +66,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
   <key>CFBundleShortVersionString</key><string>${VERSION}</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
+${ICON_NAME_KEY}
   <key>LSUIElement</key><true/>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
