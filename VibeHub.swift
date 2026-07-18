@@ -128,6 +128,29 @@ struct Mapping: Codable, Equatable {
     }
 }
 
+/// 旧 app 配置解码用：老 Mapping 可能缺 mode 字段（v1.x），用 decodeIfPresent 兜底。
+private struct LegacyMapping: Decodable {
+    let enabled: Bool
+    let keys: [String]
+    let mode: MappingMode
+    private enum CodingKeys: String, CodingKey { case enabled, keys, mode }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? false
+        keys = (try? c.decode([String].self, forKey: .keys)) ?? []
+        mode = (try? c.decode(MappingMode.self, forKey: .mode)) ?? .tap
+    }
+    var asMapping: Mapping { Mapping(enabled: enabled, keys: keys, mode: mode) }
+}
+
+private func decodeLegacyMappings(suite: String, key: String) -> [String: Mapping]? {
+    guard let d = UserDefaults(suiteName: suite),
+          let data = d.data(forKey: key),
+          let dict = try? JSONDecoder().decode([String: LegacyMapping].self, from: data)
+    else { return nil }
+    return dict.mapValues { $0.asMapping }
+}
+
 // MARK: - 共享：NX_KEYTYPE 常量
 
 private let NX_KEYTYPE_SOUND_UP:   Int32 = 0
@@ -290,6 +313,20 @@ final class AirPodsConfig: ObservableObject {
         triple     = Mapping(enabled: false, keys: ["f15"])
         volumeUp   = Mapping(enabled: false, keys: ["f16"])
         volumeDown = Mapping(enabled: false, keys: ["f17"])
+    }
+
+    /// 从旧版 AirPodsRemap（域 com.xiabill.airpods-remap，key config_v1）导入。
+    /// 返回导入项数；读不到旧配置返回 nil。
+    func importFromLegacy() -> Int? {
+        guard let dict = decodeLegacyMappings(
+            suite: "com.xiabill.airpods-remap", key: "config_v1") else { return nil }
+        var n = 0
+        if let v = dict["single"]     { single = v;     n += 1 }
+        if let v = dict["double"]     { double = v;     n += 1 }
+        if let v = dict["triple"]     { triple = v;     n += 1 }
+        if let v = dict["volumeUp"]   { volumeUp = v;   n += 1 }
+        if let v = dict["volumeDown"] { volumeDown = v; n += 1 }
+        return n
     }
 }
 
@@ -484,8 +521,53 @@ private let buttonByUsage: [UInt64: RemoteButton] = Dictionary(uniqueKeysWithVal
     remoteButtons.map { (UInt64($0.usagePage) << 32 | UInt64($0.usage), $0) }
 )
 
+/// 用户自学习捕获的按键。usagePage/usage 是 HID 原始值，label 用户命名。
+struct CustomRemoteButton: Codable, Identifiable {
+    let id: String        // "custom-<n>"
+    var label: String
+    let usagePage: UInt32
+    let usage: UInt32
+}
+
+/// HID Keyboard usage page(0x07)→ macOS 虚拟键码。只覆盖常用项，用于给自学习按键
+/// 推断 passthrough，以便吞掉系统原生事件。查不到返回 nil。
+private let hidKeyboardUsageToVK: [UInt32: UInt16] = [
+    // 字母 a-z (0x04-0x1D)
+    0x04: 0,  0x05: 11, 0x06: 8,  0x07: 2,  0x08: 14, 0x09: 3,  0x0A: 5,  0x0B: 4,
+    0x0C: 34, 0x0D: 38, 0x0E: 40, 0x0F: 37, 0x10: 46, 0x11: 45, 0x12: 31, 0x13: 35,
+    0x14: 12, 0x15: 15, 0x16: 1,  0x17: 17, 0x18: 32, 0x19: 9,  0x1A: 13, 0x1B: 7,
+    0x1C: 16, 0x1D: 6,
+    // 数字 1-0 (0x1E-0x27)
+    0x1E: 18, 0x1F: 19, 0x20: 20, 0x21: 21, 0x22: 23, 0x23: 22, 0x24: 26, 0x25: 28,
+    0x26: 25, 0x27: 29,
+    // Enter/Esc/Backspace/Tab/Space (0x28-0x2C)
+    0x28: 36, 0x29: 53, 0x2A: 51, 0x2B: 48, 0x2C: 49,
+    // F1-F12 (0x3A-0x45)
+    0x3A: 122, 0x3B: 120, 0x3C: 99, 0x3D: 118, 0x3E: 96, 0x3F: 97,
+    0x40: 98,  0x41: 100, 0x42: 101, 0x43: 109, 0x44: 103, 0x45: 111,
+    // Home/PageUp/ForwardDelete/End/PageDown (0x4A-0x4E)
+    0x4A: 115, 0x4B: 116, 0x4C: 117, 0x4D: 119, 0x4E: 121,
+    // 方向键 Right/Left/Down/Up (0x4F-0x52)
+    0x4F: 124, 0x50: 123, 0x51: 125, 0x52: 126,
+]
+
+private func inferPassthrough(usagePage: UInt32, usage: UInt32) -> PassthroughKind {
+    if usagePage == 0x07, let vk = hidKeyboardUsageToVK[usage] { return .keyboard(vk) }
+    return .none
+}
+
+func customToRemoteButton(_ c: CustomRemoteButton) -> RemoteButton {
+    RemoteButton(id: c.id, label: c.label, usagePage: c.usagePage, usage: c.usage,
+                 passthrough: inferPassthrough(usagePage: c.usagePage, usage: c.usage))
+}
+
+/// 先查硬编码 12 颗按键，未命中再查用户自定义按键。
 func remoteButton(usagePage: UInt32, usage: UInt32) -> RemoteButton? {
-    buttonByUsage[UInt64(usagePage) << 32 | UInt64(usage)]
+    if let b = buttonByUsage[UInt64(usagePage) << 32 | UInt64(usage)] { return b }
+    if let c = RemoteConfig.shared.customButtons.first(where: {
+        $0.usagePage == usagePage && $0.usage == usage
+    }) { return customToRemoteButton(c) }
+    return nil
 }
 
 /// 默认目标设备：XING WEI 2.4G USB（常见国产 2.4G TV 遥控器接收器）
@@ -543,8 +625,10 @@ final class RemoteConfig: ObservableObject {
     private let arIntervalMsKey  = "vibehub_remote_autorepeat_interval_ms"
     private let vidKey           = "vibehub_remote_target_vid"
     private let pidKey           = "vibehub_remote_target_pid"
+    private let customKey        = "vibehub_remote_custom_v1"
 
     @Published var mappings: [String: Mapping] { didSet { saveMappings() } }
+    @Published var customButtons: [CustomRemoteButton] { didSet { saveCustom() } }
     @Published var moduleEnabled: Bool {
         didSet { UserDefaults.standard.set(moduleEnabled, forKey: enabledKey) }
     }
@@ -568,6 +652,12 @@ final class RemoteConfig: ObservableObject {
             for (k, v) in loaded { initial[k] = v }
         }
         self.mappings = initial
+        if let cdata = UserDefaults.standard.data(forKey: customKey),
+           let loaded = try? JSONDecoder().decode([CustomRemoteButton].self, from: cdata) {
+            self.customButtons = loaded
+        } else {
+            self.customButtons = []
+        }
         let d = UserDefaults.standard
         self.moduleEnabled            = (d.object(forKey: enabledKey)     as? Bool) ?? true
         self.autoRepeatEnabled        = (d.object(forKey: arEnabledKey)   as? Bool) ?? true
@@ -583,15 +673,57 @@ final class RemoteConfig: ObservableObject {
         }
     }
 
+    private func saveCustom() {
+        if let data = try? JSONEncoder().encode(customButtons) {
+            UserDefaults.standard.set(data, forKey: customKey)
+        }
+    }
+
+    /// 添加自学习按键：追加到 customButtons 并建一条默认映射。
+    func addCustomButton(label: String, usagePage: UInt32, usage: UInt32) {
+        let nums = customButtons.compactMap { Int($0.id.dropFirst("custom-".count)) }
+        let n = (nums.max() ?? 0) + 1
+        let id = "custom-\(n)"
+        customButtons.append(CustomRemoteButton(id: id, label: label,
+                                                usagePage: usagePage, usage: usage))
+        mappings[id] = Mapping()
+    }
+
+    /// 删除自学习按键：清掉按键、映射，并停掉可能残留的 auto-repeat。
+    func removeCustomButton(_ id: String) {
+        customButtons.removeAll { $0.id == id }
+        mappings.removeValue(forKey: id)
+        RemoteEngine.shared.stopAutoRepeat(buttonId: id)
+    }
+
     func resetToDefaults() {
         var fresh: [String: Mapping] = [:]
         for b in remoteButtons { fresh[b.id] = Mapping() }
+        for c in customButtons { fresh[c.id] = Mapping() }
         mappings = fresh
         autoRepeatEnabled = true
         autoRepeatInitialDelayMs = 500
         autoRepeatIntervalMs = 100
         targetVID = DEFAULT_TARGET_VID
         targetPID = DEFAULT_TARGET_PID
+    }
+
+    /// 从旧版 RemoteRemap（域 com.xiabill.remote-remap）导入映射与散键设置。
+    /// 返回导入的映射条数；读不到旧配置返回 nil。
+    func importFromLegacy() -> Int? {
+        let suite = "com.xiabill.remote-remap"
+        guard let d = UserDefaults(suiteName: suite) else { return nil }
+        guard let dict = decodeLegacyMappings(suite: suite, key: "remote_remap_v1") else { return nil }
+        var merged = mappings
+        for (k, v) in dict { merged[k] = v }
+        mappings = merged
+        // 散键设置（存在才覆盖）
+        if let v = d.object(forKey: "autoRepeatEnabled") as? Bool { autoRepeatEnabled = v }
+        if let v = d.object(forKey: "autoRepeatInitialDelayMs") as? Int { autoRepeatInitialDelayMs = v }
+        if let v = d.object(forKey: "autoRepeatIntervalMs") as? Int { autoRepeatIntervalMs = v }
+        if let v = d.object(forKey: "targetVID") as? Int { targetVID = v }
+        if let v = d.object(forKey: "targetPID") as? Int { targetPID = v }
+        return dict.count
     }
 
     func binding(for buttonId: String) -> Binding<Mapping> {
@@ -610,6 +742,12 @@ final class RemoteEngine: ObservableObject {
     @Published private(set) var isRunning = false
     @Published private(set) var deviceConnected = false
     @Published var lastError: String?
+
+    // —— 自学习模式 ——
+    struct LearnedUsage: Equatable { let page: UInt32; let usage: UInt32 }
+    @Published var isLearning = false
+    @Published var learnedUsage: LearnedUsage?
+    private var learnTimer: Timer?
 
     private var manager: IOHIDManager?
     private var openedDevices: Set<IOHIDDevice> = []
@@ -807,11 +945,37 @@ final class RemoteEngine: ObservableObject {
         }
     }
 
+    // HID 回调在主 runloop（IOHIDManagerScheduleWithRunLoop main），@Published 更新安全。
+    func startLearning() {
+        learnedUsage = nil
+        isLearning = true
+        learnTimer?.invalidate()
+        learnTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: false) { [weak self] _ in
+            self?.stopLearning()
+        }
+    }
+
+    func stopLearning() {
+        isLearning = false
+        learnTimer?.invalidate()
+        learnTimer = nil
+    }
+
     private func handleInputValue(_ value: IOHIDValue) {
         let element = IOHIDValueGetElement(value)
         let usagePage = IOHIDElementGetUsagePage(element)
         let usage = IOHIDElementGetUsage(element)
         let intValue = IOHIDValueGetIntegerValue(value)
+        if isLearning {
+            guard intValue != 0 else { return }
+            // 过滤噪声：键盘页 reserved/rollover(<0x04) 和修饰键(0xE0-0xE7)、usage 0、已存在的按键
+            if usagePage == 0x07, usage < 0x04 || (usage >= 0xE0 && usage <= 0xE7) { return }
+            if usage == 0 { return }
+            if remoteButton(usagePage: usagePage, usage: usage) != nil { return }
+            learnedUsage = LearnedUsage(page: usagePage, usage: usage)
+            stopLearning()
+            return  // 学习态下不 dispatch
+        }
         guard let button = remoteButton(usagePage: usagePage, usage: usage) else { return }
         let isDown = (intValue != 0)
         dispatch(button: button, isDown: isDown)
@@ -858,7 +1022,7 @@ final class RemoteEngine: ObservableObject {
         repeatTimers[buttonId] = initial
     }
 
-    private func stopAutoRepeat(buttonId: String) {
+    func stopAutoRepeat(buttonId: String) {
         repeatTimers[buttonId]?.invalidate()
         repeatTimers[buttonId] = nil
     }
@@ -992,6 +1156,7 @@ struct AirPodsTabView: View {
     @ObservedObject var config = AirPodsConfig.shared
     @ObservedObject var tap = AirPodsTap.shared
     @State private var hasAccessibility = AirPodsTap.shared.hasAccessibility()
+    @State private var importMsg: String?
 
     var body: some View {
         ScrollView {
@@ -1050,6 +1215,17 @@ struct AirPodsTabView: View {
                 }
 
                 HStack {
+                    Button("从旧版导入") {
+                        if let n = config.importFromLegacy() {
+                            importMsg = "已导入 \(n) 项"
+                        } else {
+                            importMsg = "未找到旧版配置"
+                        }
+                    }
+                    .buttonStyle(.borderless).font(.caption)
+                    if let msg = importMsg {
+                        Text(msg).font(.caption).foregroundColor(.secondary)
+                    }
                     Spacer()
                     Button("重置 AirPods 默认") { config.resetToDefaults() }
                         .buttonStyle(.borderless).font(.caption)
@@ -1073,6 +1249,8 @@ struct RemoteTabView: View {
     @ObservedObject var config = RemoteConfig.shared
     @ObservedObject var engine = RemoteEngine.shared
     @State private var detectedDevices: [DetectedDevice] = []
+    @State private var learnName: String = ""
+    @State private var importMsg: String?
 
     private let groupDpad   = ["up", "down", "left", "right", "ok", "menu"]
     private let groupSystem = ["home", "back", "voice"]
@@ -1100,9 +1278,22 @@ struct RemoteTabView: View {
                 sectionGroup("方向 / 确认", ids: groupDpad)
                 sectionGroup("系统功能",    ids: groupSystem)
                 sectionGroup("音量",        ids: groupVolume)
+                customSection
                 autoRepeatSection
 
                 HStack {
+                    Button("从旧版导入") {
+                        if let n = config.importFromLegacy() {
+                            importMsg = "已导入 \(n) 项"
+                            engine.restart()
+                        } else {
+                            importMsg = "未找到旧版配置"
+                        }
+                    }
+                    .buttonStyle(.borderless).font(.caption)
+                    if let msg = importMsg {
+                        Text(msg).font(.caption).foregroundColor(.secondary)
+                    }
                     Spacer()
                     Button("重置 Remote 默认") { config.resetToDefaults() }
                         .buttonStyle(.borderless).font(.caption)
@@ -1212,6 +1403,69 @@ struct RemoteTabView: View {
                 Text("⚠️ 当前 VID/PID 没找到匹配设备。点「切换…」选择已插着的硬件。")
                     .font(.caption2).foregroundColor(.orange)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var customSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("自定义按键").font(.caption2).foregroundColor(.secondary).padding(.top, 2)
+            ForEach(config.customButtons) { c in
+                HStack(spacing: 4) {
+                    KeyPickerRow(label: c.label, labelWidth: 68,
+                        mapping: config.binding(for: c.id), showModePicker: false)
+                    Button { config.removeCustomButton(c.id) } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.borderless).help("删除此自定义按键")
+                }
+            }
+            learnControls
+        }
+    }
+
+    @ViewBuilder private var learnControls: some View {
+        if engine.isLearning {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text("请按遥控器上的按键…（10 秒）")
+                    .font(.caption).foregroundColor(.secondary)
+                Spacer()
+                Button("取消") { engine.stopLearning() }
+                    .buttonStyle(.borderless).font(.caption)
+            }
+        } else if let lu = engine.learnedUsage {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(String(format: "捕获 0x%02X:0x%02X", lu.page, lu.usage))
+                    .font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
+                HStack(spacing: 6) {
+                    TextField("按键名称", text: $learnName)
+                        .textFieldStyle(.roundedBorder).controlSize(.small)
+                    Button("确认") {
+                        let name = learnName.trimmingCharacters(in: .whitespaces)
+                        let fallback = String(format: "0x%02X:0x%02X", lu.page, lu.usage)
+                        config.addCustomButton(label: name.isEmpty ? fallback : name,
+                                               usagePage: lu.page, usage: lu.usage)
+                        learnName = ""
+                        engine.learnedUsage = nil
+                    }.font(.caption)
+                    Button("取消") {
+                        learnName = ""
+                        engine.learnedUsage = nil
+                    }.buttonStyle(.borderless).font(.caption)
+                }
+            }
+        } else {
+            HStack {
+                Button {
+                    learnName = ""
+                    engine.startLearning()
+                } label: {
+                    Label("学习新按键", systemImage: "plus")
+                }.buttonStyle(.borderless).font(.caption)
+                if !engine.isRunning {
+                    Text("需先启动 Remote 模块").font(.caption2).foregroundColor(.secondary)
+                }
             }
         }
     }

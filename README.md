@@ -19,7 +19,7 @@
 | 模块 | 输入设备 | 监听机制 | 触发点 |
 |---|---|---|---|
 | **AirPods** | AirPods 系列 / 任何走 AVRCP 协议的蓝牙耳机 | `CGEventTap` 监听 NSSystemDefined 媒体键事件 | 单击 / 双击 / 三击 stem + stem 上下滑（音量+/-） |
-| **Remote** | 2.4G USB 遥控键盘（默认 XING WEI 0x1915:0x1025；任意 HID 键盘类设备可切换） | `IOHIDManager` 直接读 HID + `CGEventTap` 吞掉系统原行为 | 方向键×4 / OK / 菜单 / 主页 / 返回 / 语音 / 静音 / 音量+/- 共 12 颗 |
+| **Remote** | 2.4G USB 遥控键盘（默认 XING WEI 0x1915:0x1025；任意 HID 键盘类设备可切换） | `IOHIDManager` 直接读 HID + `CGEventTap` 吞掉系统原行为 | 方向键×4 / OK / 菜单 / 主页 / 返回 / 语音 / 静音 / 音量+/- 共 12 颗，另可自学习自定义按键 |
 
 两个模块**独立启停**、独立配置、独立持久化，状态栏图标统一显示运行状态。可以只开 AirPods、只开 Remote、或两个都开。
 
@@ -118,6 +118,7 @@ macOS 的 TCC（权限数据库）用 app 的 **designated requirement** 作为�
   - 每行：启用 toggle + 按键列表（任意 chord）+ 「点按 / 按住」模式选择
   - **「点按」** = 按一下立刻松开（适合 ⌘C / ⌘V / F13 等普通快捷键）
   - **「按住」** = 按一下进入按住状态，再按一下释放（**专为 Typeless / WhisperKey 这种长按 Opt 录音的应用设计**）
+- **从旧版导入**：一键读取 AirPodsRemap 的配置并覆盖当前设置
 - 重置 AirPods 默认（单击=按住⌥，其他禁用）
 
 ### Remote Tab
@@ -125,7 +126,9 @@ macOS 的 TCC（权限数据库）用 app 的 **designated requirement** 作为�
 - **启动 / 暂停 Remote 模块** + 输入监听权限快捷链接
 - **目标设备**：默认 XING WEI 0x1915:0x1025；点「切换…」可下拉选择当前已插上的任意 HID 键盘类设备
 - 12 行映射，分 3 组：方向 / 确认 / 系统功能 / 音量
+- **自定义按键（自学习）**：点「学习新按键」→ 进入学习模式（10 秒）→ 按遥控器上任意未收录的键 → 捕获 HID usagePage/usage → 命名保存 → 出现在映射列表可配置 chord。键盘页（0x07）的按键会自动推断 passthrough 以吞掉系统原生事件。删除自定义按键的行尾垃圾桶按钮同时清掉映射
 - **长按自动重复**：开关 + 启动延迟（200–1500ms）+ 重复间隔（30–500ms）滑块
+- **从旧版导入**：一键读取 RemoteRemap 的映射与设备/自动重复设置并覆盖当前设置
 - 重置 Remote 默认（全部禁用）
 
 ### 全局
@@ -161,7 +164,7 @@ macOS 的 TCC（权限数据库）用 app 的 **designated requirement** 作为�
 
 ## 工作原理
 
-`VibeHub.swift`（单文件，~1590 行 Swift / SwiftUI / Cocoa）
+`VibeHub.swift`（单文件，~1844 行 Swift / SwiftUI / Cocoa）
 
 ### 共享层
 
@@ -237,7 +240,7 @@ CGEvent.post 出去 + sourceUserData 写 VH_EVENT_MAGIC（让 tap 不吞自己�
 
 ```
 .
-├── VibeHub.swift          # 单文件源码（~1590 行）
+├── VibeHub.swift          # 单文件源码（~1844 行）
 ├── probe.swift            # HID 事件探测器（加新硬件时用）
 ├── make-icon.swift        # 程序图标生成器（青蓝渐变 ⌘）
 ├── setup-codesign.sh      # 一次性创建 self-signed 证书
@@ -258,7 +261,7 @@ CGEvent.post 出去 + sourceUserData 写 VH_EVENT_MAGIC（让 tap 不吞自己�
 | [xiabill/remote-remap](https://github.com/xiabill/remote-remap) | 单独维护中 | 只想要遥控器映射的用户可以继续装这个 |
 | **xiabill/VibeHub**（本项目） | **推荐：两边都想用的用户** | 单 binary、单权限、单菜单栏图标，UI 用 TabView |
 
-VibeHub 不会自动迁移老 app 的 UserDefaults 配置，需要重新配一遍（5 个手势 + 12 颗按键，几分钟）。配好后建议把老 app 暂停或退出，避免两个 app 抢同一个 NSSystemDefined 事件源。
+如果之前用过老 app，可在对应 Tab 点「从旧版导入」一键读取 AirPodsRemap / RemoteRemap 的 UserDefaults 配置并覆盖当前设置（无需重配）。导入后建议把老 app 暂停或退出，避免两个 app 抢同一个 NSSystemDefined 事件源。
 
 ---
 
