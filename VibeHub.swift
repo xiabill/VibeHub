@@ -898,6 +898,7 @@ final class RemoteEngine: ObservableObject {
         guard isRunning else { return }
         stopAllAutoRepeats()
         clearSwallows()
+        stopLearning()
         if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
         if let src = tapRunLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes) }
         eventTap = nil
@@ -966,8 +967,9 @@ final class RemoteEngine: ObservableObject {
         let usagePage = IOHIDElementGetUsagePage(element)
         let usage = IOHIDElementGetUsage(element)
         let intValue = IOHIDValueGetIntegerValue(value)
-        if isLearning {
-            guard intValue != 0 else { return }
+        // 学习态只拦截按下(value!=0)：key-up 必须放行到正常 dispatch，
+        // 否则学习前按住的键抬起被吞，auto-repeat 停不下来、swallowSet 残留。
+        if isLearning, intValue != 0 {
             // 过滤噪声：键盘页 reserved/rollover(<0x04) 和修饰键(0xE0-0xE7)、usage 0、已存在的按键
             if usagePage == 0x07, usage < 0x04 || (usage >= 0xE0 && usage <= 0xE7) { return }
             if usage == 0 { return }
