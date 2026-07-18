@@ -172,13 +172,19 @@ final class KeyRecorder: ObservableObject {
     private func handle(_ e: NSEvent) -> NSEvent? {
         switch e.type {
         case .keyDown:
-            let mods = e.modifierFlags.intersection(recordRelevantFlags)
+            // 剔除 .function：方向键/F13-F20/Home 等的 modifierFlags 自带该位，
+            // 不剔会把 chord 误录成 [fn, ↑]。物理 fn 仍可走纯修饰键路径或手动菜单。
+            let mods = e.modifierFlags.intersection(recordRelevantFlags).subtracting(.function)
             if e.keyCode == 53, mods.isEmpty {          // Esc 且无修饰 → 取消
                 onCancel?()
                 return nil
             }
             if let main = mainKeyChoice(forKeyCode: e.keyCode) {
-                onCommit?(modifierIdsFromFlags(mods) + [main.id])
+                let commit = onCommit
+                // 先清状态再提交：防止 stop() 生效前迟到的 flagsChanged 用纯修饰键覆盖
+                onCommit = nil
+                seenModifiers = []
+                commit?(modifierIdsFromFlags(mods) + [main.id])
             } else {
                 NSSound.beep()                           // 查不到主键：beep 并保持录制态
             }
@@ -192,8 +198,10 @@ final class KeyRecorder: ObservableObject {
             }
             if e.modifierFlags.intersection(recordRelevantFlags).isEmpty, !seenModifiers.isEmpty {
                 let captured = seenModifiers
+                let commit = onCommit
+                onCommit = nil
                 seenModifiers = []
-                onCommit?(captured)                      // 全部松开 → 提交纯修饰键 chord
+                commit?(captured)                        // 全部松开 → 提交纯修饰键 chord
             }
             return e                                     // flagsChanged 原样返回
         default:
@@ -1458,7 +1466,13 @@ struct AirPodsTabView: View {
             get: { tap.isRunning },
             set: { want in
                 if want {
-                    if tap.start() { config.moduleEnabled = true }
+                    if tap.start() {
+                        config.moduleEnabled = true
+                    } else {
+                        // start() 失败不触碰任何 @Published，SwiftUI 不会重读 get，
+                        // 开关会视觉停在 ON。手动发一次变更让它弹回。
+                        DispatchQueue.main.async { tap.objectWillChange.send() }
+                    }
                 } else {
                     tap.stop()
                     config.moduleEnabled = false
