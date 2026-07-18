@@ -95,6 +95,131 @@ func keyChoice(_ id: String) -> KeyChoice? {
     keyChoices.first { $0.id == id }
 }
 
+extension KeyChoice {
+    /// chip 键帽用的短标签：修饰键只留符号，其余用 label 去掉 CJK 注音后缀。
+    var shortLabel: String {
+        switch id {
+        case "lopt", "ropt":   return "⌥"
+        case "lcmd", "rcmd":   return "⌘"
+        case "lctrl", "rctrl": return "⌃"
+        case "lshift", "rshift": return "⇧"
+        case "fn":             return "fn"
+        default:
+            var out = ""
+            for ch in label {
+                if let s = ch.unicodeScalars.first, s.value >= 0x3000 { break }  // 遇到 CJK/日文即截断
+                out.append(ch)
+            }
+            let trimmed = out.trimmingCharacters(in: CharacterSet(charactersIn: " (（"))
+            return trimmed.isEmpty ? label : trimmed
+        }
+    }
+}
+
+// MARK: - 共享：按键录制（NSEvent 本地监听）
+
+/// 修饰键 keyCode → chord id（可区分左右，用于纯修饰键录制）。
+private let modifierKeyCodeToId: [UInt16: String] = [
+    58: "lopt", 61: "ropt", 55: "lcmd", 54: "rcmd",
+    59: "lctrl", 62: "rctrl", 56: "lshift", 60: "rshift", 63: "fn",
+]
+/// 修饰键 keyCode → NSEvent 设备无关 flag（判断该 flagsChanged 是按下还是抬起）。
+private let modifierKeyCodeToNSFlag: [UInt16: NSEvent.ModifierFlags] = [
+    58: .option, 61: .option, 55: .command, 54: .command,
+    59: .control, 62: .control, 56: .shift, 60: .shift, 63: .function,
+]
+private let recordRelevantFlags: NSEvent.ModifierFlags = [.command, .option, .control, .shift, .function]
+
+/// event.modifierFlags → chord id 列表（左右不分时默认 left），顺序 fn/ctrl/opt/shift/cmd。
+private func modifierIdsFromFlags(_ flags: NSEvent.ModifierFlags) -> [String] {
+    var ids: [String] = []
+    if flags.contains(.function) { ids.append("fn") }
+    if flags.contains(.control)  { ids.append("lctrl") }
+    if flags.contains(.option)   { ids.append("lopt") }
+    if flags.contains(.shift)    { ids.append("lshift") }
+    if flags.contains(.command)  { ids.append("lcmd") }
+    return ids
+}
+/// keyCode 反查主键（排除纯修饰键）。
+private func mainKeyChoice(forKeyCode kc: UInt16) -> KeyChoice? {
+    keyChoices.first { $0.keyCode == kc && modifierKeyCodeToId[kc] == nil }
+}
+
+/// 单行按键录制器。进入录制态时装 local monitor，离开时销毁；全局同一时刻只应有一个在跑。
+final class KeyRecorder: ObservableObject {
+    private var monitor: Any?
+    private var seenModifiers: [String] = []   // 纯修饰键 chord：flagsChanged 累积出现过的修饰键
+    private var onCommit: (([String]) -> Void)?
+    private var onCancel: (() -> Void)?
+
+    func start(commit: @escaping ([String]) -> Void, cancel: @escaping () -> Void) {
+        stop()
+        onCommit = commit
+        onCancel = cancel
+        seenModifiers = []
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] e in
+            self?.handle(e) ?? e
+        }
+    }
+
+    func stop() {
+        if let m = monitor { NSEvent.removeMonitor(m); monitor = nil }
+        seenModifiers = []
+        onCommit = nil
+        onCancel = nil
+    }
+
+    private func handle(_ e: NSEvent) -> NSEvent? {
+        switch e.type {
+        case .keyDown:
+            let mods = e.modifierFlags.intersection(recordRelevantFlags)
+            if e.keyCode == 53, mods.isEmpty {          // Esc 且无修饰 → 取消
+                onCancel?()
+                return nil
+            }
+            if let main = mainKeyChoice(forKeyCode: e.keyCode) {
+                onCommit?(modifierIdsFromFlags(mods) + [main.id])
+            } else {
+                NSSound.beep()                           // 查不到主键：beep 并保持录制态
+            }
+            return nil                                   // 吞掉 keyDown，避免触发系统快捷键
+        case .flagsChanged:
+            if let id = modifierKeyCodeToId[e.keyCode],
+               let flag = modifierKeyCodeToNSFlag[e.keyCode],
+               e.modifierFlags.contains(flag),           // 该修饰键此刻是按下（非抬起）
+               !seenModifiers.contains(id) {
+                seenModifiers.append(id)
+            }
+            if e.modifierFlags.intersection(recordRelevantFlags).isEmpty, !seenModifiers.isEmpty {
+                let captured = seenModifiers
+                seenModifiers = []
+                onCommit?(captured)                      // 全部松开 → 提交纯修饰键 chord
+            }
+            return e                                     // flagsChanged 原样返回
+        default:
+            return e
+        }
+    }
+}
+
+/// 重启 App（授权后生效 / 菜单「重新启动」共用）。
+func restartApp() {
+    let bundlePath = Bundle.main.bundlePath
+    let task = Process()
+    task.launchPath = "/bin/sh"
+    task.arguments = ["-c", "sleep 0.5 && open \"\(bundlePath)\""]
+    try? task.run()
+    NSApp.terminate(nil)
+}
+
+/// 面板卡片外观（背景 primary 0.045 + 12pt 内边距）。
+extension View {
+    func vhCard() -> some View {
+        self.padding(12)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.045)))
+    }
+}
+
 // 修饰键 keyCode → CGEventFlags。post 修饰键时必须把对应 mask 加到 flags 里，
 // 系统才认为该修饰键真的"按下"。Typeless 之类监听 Opt 状态的应用就靠这个。
 private let modifierKeyMask: [UInt16: CGEventFlags] = [
@@ -1068,87 +1193,254 @@ final class LaunchAtLogin: ObservableObject {
 
 // MARK: - UI: 共享单行编辑器（AirPods + Remote 都用）
 
-/// 懒加载的按键选择器：用 Menu 替代 Picker —— Menu 的 ForEach 子项只在用户点开下拉时才构建，
-/// 折叠状态只有一个 label 在视图树里。把首次 popover 打开的 SwiftUI body 评估成本降一个量级。
-struct LazyKeyMenu: View {
-    @Binding var selection: String
-    let enabled: Bool
-
-    private var currentLabel: String { keyChoice(selection)?.label ?? "?" }
-
+/// chord 键帽 chip（等宽小圆角标签）。
+struct KeyChip: View {
+    let text: String
     var body: some View {
-        Menu {
-            ForEach(keyChoices) { c in
-                Button(c.label) { selection = c.id }
-            }
-        } label: {
-            Text(currentLabel)
-                .font(.system(size: 12))
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .controlSize(.small)
-        .disabled(!enabled)
+        Text(text)
+            .font(.system(.caption, design: .monospaced))
+            .padding(.horizontal, 6).padding(.vertical, 3)
+            .background(RoundedRectangle(cornerRadius: 5).fill(Color.secondary.opacity(0.15)))
     }
 }
 
+/// ⓘ 说明按钮：.help() tooltip + 点击 popover 双保险。
+struct InfoPopoverButton<Content: View>: View {
+    let help: String
+    @ViewBuilder let content: () -> Content
+    @State private var shown = false
+    var body: some View {
+        Button { shown.toggle() } label: {
+            Image(systemName: "info.circle").font(.system(size: 11))
+        }
+        .buttonStyle(.borderless)
+        .help(help)
+        .popover(isPresented: $shown, arrowEdge: .bottom) {
+            content()
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(10)
+                .frame(width: 250)
+        }
+    }
+}
+
+/// 一行绑定：启用 Toggle + 手势名 + chord chips + 录制按钮 +（可选）模式菜单 + 手动编辑菜单。
 struct KeyPickerRow: View {
     let label: String
     let labelWidth: CGFloat
     @Binding var mapping: Mapping
     let showModePicker: Bool  // AirPods=true（点按/按住），Remote=false
+    let rowId: String
+    @Binding var recordingRowId: String?
 
-    private var firstKeyBinding: Binding<String> {
-        Binding(
-            get: { mapping.keys.first ?? "lopt" },
-            set: { v in
-                if mapping.keys.isEmpty { mapping.keys.append(v) }
-                else { mapping.keys[0] = v }
-            }
-        )
-    }
+    @StateObject private var recorder = KeyRecorder()
+
+    private var isRecording: Bool { recordingRowId == rowId }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 6) {
-                Toggle("", isOn: $mapping.enabled).labelsHidden()
-                Text(label).frame(width: labelWidth, alignment: .leading).font(.system(size: 12))
-
-                LazyKeyMenu(selection: firstKeyBinding, enabled: mapping.enabled)
-                    .frame(maxWidth: .infinity)
-
-                if showModePicker {
-                    Picker("", selection: $mapping.mode) {
-                        Text("点按").tag(MappingMode.tap)
-                        Text("按住").tag(MappingMode.holdToggle)
-                    }
-                    .pickerStyle(.segmented).labelsHidden().frame(width: 72)
-                    .disabled(!mapping.enabled).controlSize(.small)
-                }
-
-                Button { mapping.keys.append("lopt") } label: {
-                    Image(systemName: "plus.circle")
-                }
-                .buttonStyle(.borderless).help("追加 chord 按键").disabled(!mapping.enabled)
+        HStack(spacing: 6) {
+            Toggle("", isOn: $mapping.enabled).labelsHidden().controlSize(.small)
+            Text(label).frame(width: labelWidth, alignment: .leading).font(.system(size: 12))
+            Spacer(minLength: 4)
+            if isRecording {
+                Text("按下快捷键…")
+                    .font(.caption).foregroundColor(.accentColor)
+                    .padding(.horizontal, 6).padding(.vertical, 3)
+                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.accentColor, lineWidth: 1))
+            } else {
+                chips
             }
+            if showModePicker { modeMenu }
+            recordButton
+            manualMenu
+        }
+        .onChange(of: isRecording) { rec in
+            if rec {
+                recorder.start(
+                    commit: { keys in
+                        mapping.keys = keys
+                        mapping.enabled = true       // 录完即启用，否则绑了不生效令人困惑
+                        recordingRowId = nil
+                    },
+                    cancel: { recordingRowId = nil }
+                )
+            } else {
+                recorder.stop()
+            }
+        }
+        .onDisappear {
+            if isRecording { recordingRowId = nil }  // popover 关闭强制取消
+            recorder.stop()
+        }
+    }
 
-            if mapping.keys.count > 1 {
-                ForEach(1..<mapping.keys.count, id: \.self) { idx in
-                    HStack(spacing: 6) {
-                        Spacer().frame(width: labelWidth + 24)
-                        Image(systemName: "plus").foregroundColor(.secondary).font(.system(size: 9))
-                        LazyKeyMenu(selection: Binding(
-                            get: { idx < mapping.keys.count ? mapping.keys[idx] : "lopt" },
-                            set: { v in if idx < mapping.keys.count { mapping.keys[idx] = v } }
-                        ), enabled: mapping.enabled).frame(maxWidth: .infinity)
-                        Button {
-                            if idx < mapping.keys.count { mapping.keys.remove(at: idx) }
-                        } label: { Image(systemName: "minus.circle") }
-                            .buttonStyle(.borderless)
-                    }
-                    .disabled(!mapping.enabled)
+    private var chips: some View {
+        HStack(spacing: 3) {
+            if mapping.keys.isEmpty {
+                Text("未绑定").font(.caption).foregroundColor(.secondary)
+            } else {
+                ForEach(Array(mapping.keys.enumerated()), id: \.offset) { _, k in
+                    KeyChip(text: keyChoice(k)?.shortLabel ?? "?")
                 }
             }
         }
+    }
+
+    private var recordButton: some View {
+        Button {
+            recordingRowId = isRecording ? nil : rowId
+        } label: {
+            Image(systemName: isRecording ? "stop.circle.fill" : "record.circle")
+                .foregroundColor(isRecording ? .accentColor : nil)
+        }
+        .buttonStyle(.borderless)
+        .help(isRecording ? "停止录制" : "录制快捷键")
+    }
+
+    private var modeMenu: some View {
+        Menu {
+            Button("点按") { mapping.mode = .tap }
+            Button("按住") { mapping.mode = .holdToggle }
+        } label: {
+            Text(mapping.mode == .tap ? "点按" : "按住").font(.caption)
+        }
+        .menuStyle(.borderlessButton).fixedSize()
+        .disabled(!mapping.enabled)
+    }
+
+    private func setKey(_ idx: Int, _ id: String) {
+        if idx < mapping.keys.count { mapping.keys[idx] = id }
+    }
+    private func removeKey(_ idx: Int) {
+        if idx < mapping.keys.count { mapping.keys.remove(at: idx) }
+    }
+
+    /// 手动编辑：逐键改 / 删键 / 追加键（F13–F20 等按不出来的键靠它）。
+    private var manualMenu: some View {
+        Menu {
+            ForEach(mapping.keys.indices, id: \.self) { idx in
+                Menu {
+                    ForEach(keyChoices) { c in
+                        Button(c.label) { setKey(idx, c.id) }
+                    }
+                    if mapping.keys.count > 1 {
+                        Divider()
+                        Button("删除此键", role: .destructive) { removeKey(idx) }
+                    }
+                } label: {
+                    Text("第 \(idx + 1) 键：\(keyChoice(mapping.keys[idx])?.shortLabel ?? "?")")
+                }
+            }
+            Divider()
+            Button("追加按键") { mapping.keys.append("lopt") }
+        } label: {
+            Image(systemName: "ellipsis")
+        }
+        .menuStyle(.borderlessButton).fixedSize()
+        .help("手动编辑绑定")
+    }
+}
+
+// MARK: - UI: 权限引导卡
+
+enum PermissionKind {
+    case accessibility, inputMonitoring
+
+    var name: String {
+        switch self {
+        case .accessibility:  return "辅助功能"
+        case .inputMonitoring: return "输入监听"
+        }
+    }
+    var icon: String {
+        switch self {
+        case .accessibility:  return "hand.raised"
+        case .inputMonitoring: return "keyboard"
+        }
+    }
+    var url: String {
+        switch self {
+        case .accessibility:
+            return "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        case .inputMonitoring:
+            return "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
+        }
+    }
+    func granted() -> Bool {
+        switch self {
+        case .accessibility:
+            return AXIsProcessTrusted()
+        case .inputMonitoring:
+            return IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
+        }
+    }
+}
+
+/// 缺权限时显示的橙色引导卡。面板可见期间每 1 秒轮询；授权后变 ✓ 并提示重启；全就绪且从未缺失则隐藏。
+struct PermissionCard: View {
+    let specs: [PermissionKind]
+    @State private var granted: [Bool] = []
+    @State private var everMissing = false
+    @State private var timer: Timer?
+
+    private func refresh() {
+        let g = specs.map { $0.granted() }
+        granted = g
+        if g.contains(false) { everMissing = true }
+    }
+    private var allGranted: Bool { !granted.isEmpty && !granted.contains(false) }
+
+    var body: some View {
+        Group {
+            if granted.isEmpty || (allGranted && !everMissing) {
+                Color.clear.frame(height: 0)
+            } else {
+                content
+            }
+        }
+        .onAppear {
+            refresh()
+            timer?.invalidate()
+            timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in refresh() }
+        }
+        .onDisappear {
+            timer?.invalidate()
+            timer = nil
+        }
+    }
+
+    private var content: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.shield")
+                Text("需要权限").font(.subheadline.weight(.semibold))
+            }
+            ForEach(Array(specs.enumerated()), id: \.offset) { i, spec in
+                HStack(spacing: 6) {
+                    Image(systemName: spec.icon).frame(width: 16)
+                    Text(spec.name).font(.caption)
+                    Spacer()
+                    if i < granted.count, granted[i] {
+                        Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
+                    } else {
+                        Image(systemName: "xmark.circle.fill").foregroundColor(.orange)
+                        Button("去开启") { NSWorkspace.shared.open(URL(string: spec.url)!) }
+                            .buttonStyle(.borderless).font(.caption)
+                    }
+                }
+            }
+            if allGranted && everMissing {
+                Divider()
+                HStack(spacing: 6) {
+                    Text("已授权，重启 App 生效").font(.caption).foregroundColor(.secondary)
+                    Spacer()
+                    Button("重启") { restartApp() }.font(.caption)
+                }
+            }
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.09)))
     }
 }
 
@@ -1157,91 +1449,104 @@ struct KeyPickerRow: View {
 struct AirPodsTabView: View {
     @ObservedObject var config = AirPodsConfig.shared
     @ObservedObject var tap = AirPodsTap.shared
-    @State private var hasAccessibility = AirPodsTap.shared.hasAccessibility()
-    @State private var importMsg: String?
+    @Binding var recordingRowId: String?
+    @State private var actionMsg: String?
+
+    /// 开关绑定：读 tap.isRunning，start() 失败时 isRunning 仍为 false → 开关自动弹回。
+    private var moduleToggle: Binding<Bool> {
+        Binding(
+            get: { tap.isRunning },
+            set: { want in
+                if want {
+                    if tap.start() { config.moduleEnabled = true }
+                } else {
+                    tap.stop()
+                    config.moduleEnabled = false
+                }
+            }
+        )
+    }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 6) {
-                    Image(systemName: "earbuds")
-                    Text("AirPods / 蓝牙耳机媒体键").font(.subheadline.weight(.semibold))
-                    Spacer()
-                    Circle()
-                        .fill(tap.isRunning ? Color.green : Color.secondary)
-                        .frame(width: 8, height: 8)
-                    Text(tap.isRunning ? "运行中" : "已暂停")
-                        .font(.caption).foregroundColor(.secondary)
-                }
-
-                HStack(spacing: 8) {
-                    Button {
-                        if tap.isRunning {
-                            tap.stop()
-                            config.moduleEnabled = false
-                        } else {
-                            hasAccessibility = tap.hasAccessibility(prompt: true)
-                            if hasAccessibility, tap.start() {
-                                config.moduleEnabled = true
-                            }
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: tap.isRunning ? "pause.fill" : "play.fill")
-                            Text(tap.isRunning ? "暂停 AirPods 模块" : "启动 AirPods 模块")
-                        }.frame(maxWidth: .infinity)
-                    }
-                    Button("辅助功能…") {
-                        NSWorkspace.shared.open(URL(string:
-                            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-                    }
-                }
-
-                if !hasAccessibility {
-                    Text("⚠️ 需要「辅助功能」权限：系统设置 → 隐私与安全性 → 辅助功能 → 打开 VibeHub")
-                        .font(.caption).foregroundColor(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                Divider()
-
-                KeyPickerRow(label: "单击",  labelWidth: 46, mapping: $config.single,     showModePicker: true)
-                KeyPickerRow(label: "双击",  labelWidth: 46, mapping: $config.double,     showModePicker: true)
-                KeyPickerRow(label: "三击",  labelWidth: 46, mapping: $config.triple,     showModePicker: true)
-                KeyPickerRow(label: "音量+", labelWidth: 46, mapping: $config.volumeUp,   showModePicker: true)
-                KeyPickerRow(label: "音量-", labelWidth: 46, mapping: $config.volumeDown, showModePicker: true)
-
-                if config.volumeUp.enabled || config.volumeDown.enabled {
-                    Text("⚠️ 启用音量键映射后，AirPods 将无法用来调系统音量")
-                        .font(.caption2).foregroundColor(.orange)
-                }
-
-                HStack {
-                    Button("从旧版导入") {
-                        if let n = config.importFromLegacy() {
-                            importMsg = "已导入 \(n) 项"
-                        } else {
-                            importMsg = "未找到旧版配置"
-                        }
-                    }
-                    .buttonStyle(.borderless).font(.caption)
-                    if let msg = importMsg {
-                        Text(msg).font(.caption).foregroundColor(.secondary)
-                    }
-                    Spacer()
-                    Button("重置 AirPods 默认") { config.resetToDefaults() }
-                        .buttonStyle(.borderless).font(.caption)
-                }
-
-                Text("「点按」=按一下立刻松开；「按住」=按一下按住、再按一下释放（适合 Typeless / WhisperKey 长按 Opt 录音）。")
-                    .font(.caption2).foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text("注意：AirPods Pro 2 / Pro 3 的 stem 事件全部走 MediaRemote 私有 IPC，所有同类工具都拦不到。普通 AirPods / AirPods Max 工作正常。")
-                    .font(.caption2).foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            VStack(spacing: 10) {
+                moduleCard
+                PermissionCard(specs: [.accessibility])
+                bindingsCard
             }
             .padding(12)
         }
+    }
+
+    private var moduleCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "earbuds")
+                Text("AirPods / 蓝牙耳机").font(.subheadline.weight(.semibold))
+                InfoPopoverButton(help: "机型支持说明") {
+                    Text("AirPods Pro 2 / Pro 3 的 stem 事件走 MediaRemote 私有 IPC，所有同类工具都拦不到。普通 AirPods / AirPods Max 正常工作。")
+                }
+                Spacer()
+                moduleMenu
+                Toggle("", isOn: moduleToggle)
+                    .labelsHidden().toggleStyle(.switch).controlSize(.small)
+            }
+            HStack(spacing: 6) {
+                Circle().fill(tap.isRunning ? Color.green : Color.secondary).frame(width: 8, height: 8)
+                Text(tap.isRunning ? "运行中" : "已暂停").font(.caption).foregroundColor(.secondary)
+                if let msg = actionMsg {
+                    Text("· \(msg)").font(.caption).foregroundColor(.secondary)
+                }
+            }
+        }
+        .vhCard()
+    }
+
+    private var moduleMenu: some View {
+        Menu {
+            Button("重置默认") {
+                config.resetToDefaults()
+                actionMsg = "已重置"
+            }
+            Button("从旧版导入") {
+                if let n = config.importFromLegacy() {
+                    actionMsg = "已导入 \(n) 项"
+                } else {
+                    actionMsg = "无旧版配置"
+                }
+            }
+        } label: {
+            Image(systemName: "ellipsis.circle")
+        }
+        .menuStyle(.borderlessButton).fixedSize()
+    }
+
+    private var bindingsCard: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Text("手势绑定").font(.subheadline.weight(.semibold))
+                InfoPopoverButton(help: "点按 / 按住 说明") {
+                    Text("「点按」= 按一下立刻松开（适合 ⌘C / F13 等）；「按住」= 按一下按住、再按一下释放（适合 Typeless / WhisperKey 长按 ⌥ 录音）。")
+                }
+                Spacer()
+            }
+            row("单击",  $config.single,     "ap-single")
+            row("双击",  $config.double,     "ap-double")
+            row("三击",  $config.triple,     "ap-triple")
+            row("音量+", $config.volumeUp,   "ap-volup")
+            row("音量-", $config.volumeDown, "ap-voldn")
+            if config.volumeUp.enabled || config.volumeDown.enabled {
+                Text("绑定音量键后耳机将无法调节系统音量")
+                    .font(.caption2).foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .vhCard()
+    }
+
+    private func row(_ label: String, _ m: Binding<Mapping>, _ id: String) -> some View {
+        KeyPickerRow(label: label, labelWidth: 46, mapping: m, showModePicker: true,
+                     rowId: id, recordingRowId: $recordingRowId)
     }
 }
 
@@ -1250,9 +1555,10 @@ struct AirPodsTabView: View {
 struct RemoteTabView: View {
     @ObservedObject var config = RemoteConfig.shared
     @ObservedObject var engine = RemoteEngine.shared
+    @Binding var recordingRowId: String?
     @State private var detectedDevices: [DetectedDevice] = []
     @State private var learnName: String = ""
-    @State private var importMsg: String?
+    @State private var actionMsg: String?
 
     private let groupDpad   = ["up", "down", "left", "right", "ok", "menu"]
     private let groupSystem = ["home", "back", "voice"]
@@ -1265,82 +1571,109 @@ struct RemoteTabView: View {
         }
     }
 
+    /// 开关绑定：start() 可能返回 true 但 tap 装不上（会写 lastError），isRunning 反映真实态。
+    private var moduleToggle: Binding<Bool> {
+        Binding(
+            get: { engine.isRunning },
+            set: { want in
+                if want {
+                    if engine.start() { config.moduleEnabled = true }
+                } else {
+                    engine.stop()
+                    config.moduleEnabled = false
+                }
+            }
+        )
+    }
+
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 8) {
-                header
-                runStatus
-                if let err = engine.lastError {
-                    Text("⚠️ \(err)")
-                        .font(.caption).foregroundColor(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(6).background(Color.orange.opacity(0.1)).cornerRadius(6)
-                }
-                deviceSection
-                sectionGroup("方向 / 确认", ids: groupDpad)
-                sectionGroup("系统功能",    ids: groupSystem)
-                sectionGroup("音量",        ids: groupVolume)
-                customSection
-                autoRepeatSection
-
-                HStack {
-                    Button("从旧版导入") {
-                        if let n = config.importFromLegacy() {
-                            importMsg = "已导入 \(n) 项"
-                            engine.restart()
-                        } else {
-                            importMsg = "未找到旧版配置"
-                        }
-                    }
-                    .buttonStyle(.borderless).font(.caption)
-                    if let msg = importMsg {
-                        Text(msg).font(.caption).foregroundColor(.secondary)
-                    }
-                    Spacer()
-                    Button("重置 Remote 默认") { config.resetToDefaults() }
-                        .buttonStyle(.borderless).font(.caption)
-                }
+            VStack(spacing: 10) {
+                moduleCard
+                PermissionCard(specs: [.accessibility, .inputMonitoring])
+                bindingsCard
+                deviceCard
+                advancedCard
             }
             .padding(12)
         }
     }
 
-    private var header: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "av.remote")
-            Text("2.4G 遥控键盘").font(.subheadline.weight(.semibold))
-            Spacer()
-            Circle()
-                .fill(engine.isRunning && engine.deviceConnected ? Color.green
-                      : engine.isRunning ? Color.orange : Color.secondary)
-                .frame(width: 8, height: 8)
-            Text(engine.isRunning
-                 ? (engine.deviceConnected ? "运行中" : "等待设备")
-                 : "已暂停")
-                .font(.caption).foregroundColor(.secondary)
+    // —— 模块卡 ——
+
+    private var moduleCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "av.remote")
+                Text("2.4G 遥控键盘").font(.subheadline.weight(.semibold))
+                Spacer()
+                moduleMenu
+                Toggle("", isOn: moduleToggle)
+                    .labelsHidden().toggleStyle(.switch).controlSize(.small)
+            }
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(engine.isRunning && engine.deviceConnected ? Color.green
+                          : engine.isRunning ? Color.orange : Color.secondary)
+                    .frame(width: 8, height: 8)
+                Text(engine.isRunning
+                     ? (engine.deviceConnected ? "运行中" : "等待设备")
+                     : "已暂停")
+                    .font(.caption).foregroundColor(.secondary)
+                Text(currentDeviceLabel)
+                    .font(.system(size: 10, design: .monospaced)).foregroundColor(.secondary)
+                if let msg = actionMsg {
+                    Text("· \(msg)").font(.caption).foregroundColor(.secondary)
+                }
+            }
+            if let err = engine.lastError {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle").foregroundColor(.orange).font(.caption)
+                    Text(err).font(.caption2).foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button("重启") { restartApp() }.font(.caption)
+                }
+            }
         }
+        .vhCard()
     }
 
-    private var runStatus: some View {
-        HStack(spacing: 8) {
-            Button {
-                if engine.isRunning {
-                    engine.stop()
-                    config.moduleEnabled = false
+    private var moduleMenu: some View {
+        Menu {
+            Button("重置默认") {
+                config.resetToDefaults()
+                engine.restart()
+                actionMsg = "已重置"
+            }
+            Button("从旧版导入") {
+                if let n = config.importFromLegacy() {
+                    engine.restart()
+                    actionMsg = "已导入 \(n) 项"
                 } else {
-                    if engine.start() { config.moduleEnabled = true }
+                    actionMsg = "无旧版配置"
                 }
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: engine.isRunning ? "pause.fill" : "play.fill")
-                    Text(engine.isRunning ? "暂停 Remote 模块" : "启动 Remote 模块")
-                }.frame(maxWidth: .infinity)
             }
-            Button("输入监听权限…") {
-                NSWorkspace.shared.open(URL(string:
-                    "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")!)
-            }
+        } label: {
+            Image(systemName: "ellipsis.circle")
         }
+        .menuStyle(.borderlessButton).fixedSize()
+    }
+
+    private var currentDeviceLabel: String {
+        String(format: "0x%04X:0x%04X", config.targetVID, config.targetPID)
+    }
+
+    // —— 绑定卡 ——
+
+    private var bindingsCard: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("按键绑定").font(.subheadline.weight(.semibold))
+            sectionGroup("方向 / 确认", ids: groupDpad)
+            sectionGroup("系统功能",    ids: groupSystem)
+            sectionGroup("音量",        ids: groupVolume)
+        }
+        .vhCard()
     }
 
     private func sectionGroup(_ title: String, ids: [String]) -> some View {
@@ -1354,47 +1687,20 @@ struct RemoteTabView: View {
         Group {
             if let b = remoteButtons.first(where: { $0.id == id }) {
                 KeyPickerRow(label: b.label, labelWidth: 68,
-                    mapping: config.binding(for: id), showModePicker: false)
+                    mapping: config.binding(for: id), showModePicker: false,
+                    rowId: "rm-\(id)", recordingRowId: $recordingRowId)
             }
         }
     }
 
-    private var currentDeviceLabel: String {
-        String(format: "0x%04X : 0x%04X", config.targetVID, config.targetPID)
-    }
+    // —— 设备卡 ——
 
-    private var deviceSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
+    private var deviceCard: some View {
+        VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("目标设备").font(.caption2).foregroundColor(.secondary)
+                Text("目标设备").font(.subheadline.weight(.semibold))
                 Spacer()
-                Menu {
-                    if detectedDevices.isEmpty {
-                        Text("（没扫到 HID 键盘类设备）").font(.caption)
-                    } else {
-                        ForEach(detectedDevices) { dev in
-                            Button(dev.displayName) {
-                                config.targetVID = dev.vendorId
-                                config.targetPID = dev.productId
-                                engine.restart()
-                            }
-                        }
-                    }
-                    Divider()
-                    Button("重新扫描") { scanDevicesAsync() }
-                    Button("恢复默认 (XING WEI 0x1915:0x1025)") {
-                        config.targetVID = DEFAULT_TARGET_VID
-                        config.targetPID = DEFAULT_TARGET_PID
-                        engine.restart()
-                    }
-                } label: {
-                    HStack(spacing: 4) {
-                        Text("切换…").font(.caption)
-                        Image(systemName: "chevron.up.chevron.down").font(.system(size: 9))
-                    }
-                }
-                .menuStyle(.borderlessButton).fixedSize()
-                .onAppear { if detectedDevices.isEmpty { scanDevicesAsync() } }
+                deviceMenu
             }
             Text(currentDeviceLabel)
                 .font(.system(size: 11, design: .monospaced))
@@ -1402,20 +1708,17 @@ struct RemoteTabView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color.secondary.opacity(0.1)).cornerRadius(4)
             if !engine.deviceConnected && engine.isRunning {
-                Text("⚠️ 当前 VID/PID 没找到匹配设备。点「切换…」选择已插着的硬件。")
+                Text("当前 VID/PID 没找到匹配设备，点「切换…」选择已插着的硬件。")
                     .font(.caption2).foregroundColor(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
-        }
-    }
-
-    private var customSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("自定义按键").font(.caption2).foregroundColor(.secondary).padding(.top, 2)
+            Divider()
+            Text("自定义按键").font(.caption2).foregroundColor(.secondary)
             ForEach(config.customButtons) { c in
                 HStack(spacing: 4) {
                     KeyPickerRow(label: c.label, labelWidth: 68,
-                        mapping: config.binding(for: c.id), showModePicker: false)
+                        mapping: config.binding(for: c.id), showModePicker: false,
+                        rowId: "rm-\(c.id)", recordingRowId: $recordingRowId)
                     Button { config.removeCustomButton(c.id) } label: {
                         Image(systemName: "trash")
                     }
@@ -1424,13 +1727,44 @@ struct RemoteTabView: View {
             }
             learnControls
         }
+        .vhCard()
+    }
+
+    private var deviceMenu: some View {
+        Menu {
+            if detectedDevices.isEmpty {
+                Text("（没扫到 HID 键盘类设备）").font(.caption)
+            } else {
+                ForEach(detectedDevices) { dev in
+                    Button(dev.displayName) {
+                        config.targetVID = dev.vendorId
+                        config.targetPID = dev.productId
+                        engine.restart()
+                    }
+                }
+            }
+            Divider()
+            Button("重新扫描") { scanDevicesAsync() }
+            Button("恢复默认 (XING WEI 0x1915:0x1025)") {
+                config.targetVID = DEFAULT_TARGET_VID
+                config.targetPID = DEFAULT_TARGET_PID
+                engine.restart()
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text("切换…").font(.caption)
+                Image(systemName: "chevron.up.chevron.down").font(.system(size: 9))
+            }
+        }
+        .menuStyle(.borderlessButton).fixedSize()
+        .onAppear { if detectedDevices.isEmpty { scanDevicesAsync() } }
     }
 
     @ViewBuilder private var learnControls: some View {
         if engine.isLearning {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.small)
-                Text("请按遥控器上的按键…（10 秒）")
+                Text("请按下遥控器上要添加的按键…（10 秒）")
                     .font(.caption).foregroundColor(.secondary)
                 Spacer()
                 Button("取消") { engine.stopLearning() }
@@ -1438,7 +1772,7 @@ struct RemoteTabView: View {
             }
         } else if let lu = engine.learnedUsage {
             VStack(alignment: .leading, spacing: 4) {
-                Text(String(format: "捕获 0x%02X:0x%02X", lu.page, lu.usage))
+                Text(String(format: "已捕获 0x%02X:0x%02X，命名后保存", lu.page, lu.usage))
                     .font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
                 HStack(spacing: 6) {
                     TextField("按键名称", text: $learnName)
@@ -1472,15 +1806,16 @@ struct RemoteTabView: View {
         }
     }
 
-    private var autoRepeatSection: some View {
+    // —— 高级卡 ——
+
+    private var advancedCard: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text("长按自动重复").font(.caption2).foregroundColor(.secondary)
+                Text("长按自动重复").font(.subheadline.weight(.semibold))
                 Spacer()
                 Toggle("", isOn: $config.autoRepeatEnabled)
                     .toggleStyle(.switch).labelsHidden().controlSize(.mini)
             }
-            .padding(.top, 2)
             if config.autoRepeatEnabled {
                 HStack(spacing: 6) {
                     Text("启动延迟").font(.caption).frame(width: 56, alignment: .leading)
@@ -1504,6 +1839,7 @@ struct RemoteTabView: View {
                 Text("已关闭：按一次只触发一次 chord").font(.caption2).foregroundColor(.secondary)
             }
         }
+        .vhCard()
     }
 }
 
@@ -1512,6 +1848,11 @@ struct RemoteTabView: View {
 struct ContentView: View {
     @ObservedObject var loginItem = LaunchAtLogin.shared
     @State private var selectedTab: String = "airpods"
+    @State private var recordingRowId: String? = nil   // 全局唯一录制行；切 Tab 时清空
+
+    private var appVersion: String {
+        (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "dev"
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1524,18 +1865,19 @@ struct ContentView: View {
             .padding(.horizontal, 10)
             .padding(.top, 8)
             .padding(.bottom, 6)
+            .onChange(of: selectedTab) { _ in recordingRowId = nil }
 
             Divider()
 
             ZStack(alignment: .top) {
-                AirPodsTabView()
+                AirPodsTabView(recordingRowId: $recordingRowId)
                     .opacity(selectedTab == "airpods" ? 1 : 0)
                     .allowsHitTesting(selectedTab == "airpods")
-                RemoteTabView()
+                RemoteTabView(recordingRowId: $recordingRowId)
                     .opacity(selectedTab == "remote" ? 1 : 0)
                     .allowsHitTesting(selectedTab == "remote")
             }
-            .frame(width: 340, height: 620)
+            .frame(width: 360, height: 620)
 
             Divider()
 
@@ -1545,6 +1887,7 @@ struct ContentView: View {
                     set: { loginItem.setEnabled($0) }
                 )) { Text("开机自启").font(.caption) }
                 .toggleStyle(.checkbox)
+                Text("v\(appVersion)").font(.caption2).foregroundColor(.secondary)
                 Spacer()
                 Button {
                     NSApp.terminate(nil)
@@ -1563,7 +1906,7 @@ struct ContentView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .frame(width: 340)
+        .frame(width: 360)
         .background(Color(NSColor.windowBackgroundColor))
     }
 }
@@ -1626,7 +1969,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 首次点击图标时要现场建整棵树。
         let host = NSHostingController(rootView: ContentView())
         let warmup = NSWindow(
-            contentRect: NSRect(x: -50000, y: -50000, width: 340, height: 720),
+            contentRect: NSRect(x: -50000, y: -50000, width: 360, height: 720),
             styleMask: [.borderless], backing: .buffered, defer: false)
         warmup.alphaValue = 0
         warmup.contentViewController = host
@@ -1640,11 +1983,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func applyStatusIcon(to button: NSStatusBarButton) {
-        // 用 command 作为中性 hub 图标，AirPods/Remote 都不偏
-        let img = NSImage(systemSymbolName: "command", accessibilityDescription: "VibeHub")
-        img?.isTemplate = true
-        button.image = img
+        button.image = Self.statusIcon
     }
+
+    /// 程序内绘制的 18×18 template 图标：圆角方框线框内三根垂直圆头波形短柱（中高两侧低）。
+    private static let statusIcon: NSImage = {
+        let img = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { rect in
+            NSColor.black.setStroke()
+            NSColor.black.setFill()
+            let frame = rect.insetBy(dx: 1.5, dy: 1.5)
+            let box = NSBezierPath(roundedRect: frame, xRadius: 4, yRadius: 4)
+            box.lineWidth = 1.5
+            box.stroke()
+            let barW: CGFloat = 1.8
+            let spacing: CGFloat = 3.2
+            let heights: [CGFloat] = [4.5, 7.0, 4.5]
+            let xs: [CGFloat] = [rect.midX - spacing, rect.midX, rect.midX + spacing]
+            for (i, x) in xs.enumerated() {
+                let h = heights[i]
+                let bar = NSRect(x: x - barW / 2, y: rect.midY - h / 2, width: barW, height: h)
+                NSBezierPath(roundedRect: bar, xRadius: barW / 2, yRadius: barW / 2).fill()
+            }
+            return true
+        }
+        img.isTemplate = true
+        return img
+    }()
 
     private func updateIconAppearance() {
         guard let button = statusItem?.button else { return }
@@ -1725,7 +2089,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ("AirPods 音量+", apCfg.volumeUp), ("AirPods 音量-", apCfg.volumeDown),
         ]
         for (label, m) in apRows where m.enabled && !m.keys.isEmpty {
-            let names = m.keys.compactMap { keyChoice($0)?.label }.joined(separator: " + ")
+            let names = m.keys.compactMap { keyChoice($0)?.shortLabel }.joined(separator: " ")
             let item = NSMenuItem(title: "  \(label) → \(names)", action: nil, keyEquivalent: "")
             item.isEnabled = false
             menu.addItem(item)
@@ -1733,8 +2097,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let remCfg = RemoteConfig.shared
         for b in remoteButtons {
             guard let m = remCfg.mappings[b.id], m.enabled, !m.keys.isEmpty else { continue }
-            let names = m.keys.compactMap { keyChoice($0)?.label }.joined(separator: " + ")
+            let names = m.keys.compactMap { keyChoice($0)?.shortLabel }.joined(separator: " ")
             let item = NSMenuItem(title: "  Remote \(b.label) → \(names)",
+                action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        }
+        for c in remCfg.customButtons {
+            guard let m = remCfg.mappings[c.id], m.enabled, !m.keys.isEmpty else { continue }
+            let names = m.keys.compactMap { keyChoice($0)?.shortLabel }.joined(separator: " ")
+            let item = NSMenuItem(title: "  Remote \(c.label) → \(names)",
                 action: nil, keyEquivalent: "")
             item.isEnabled = false
             menu.addItem(item)
@@ -1808,25 +2180,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func menuAbout() {
         let version = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "dev"
         let alert = NSAlert()
-        alert.messageText = "VibeHub"
+        alert.icon = NSApp.applicationIconImage
+        alert.messageText = "VibeHub \(version)"
         alert.informativeText = """
-            把 AirPods / 蓝牙耳机 + 2.4G 遥控键盘的按键统一映射到任意 macOS 键盘 chord。
+            把 AirPods / 蓝牙耳机与 2.4G 遥控键盘的按键统一录制并映射到任意 macOS 键盘 chord。
 
-            • 左键状态栏图标 → 配置面板（AirPods / Remote 两个 Tab）
-            • 右键状态栏图标 → 快捷菜单
-
-            版本 \(version)
+            左键状态栏图标打开配置，右键打开快捷菜单。
+            https://github.com/xiabill/VibeHub
             """
         alert.runModal()
     }
-    @objc private func menuRestart() {
-        let bundlePath = Bundle.main.bundlePath
-        let task = Process()
-        task.launchPath = "/bin/sh"
-        task.arguments = ["-c", "sleep 0.5 && open \"\(bundlePath)\""]
-        try? task.run()
-        NSApp.terminate(nil)
-    }
+    @objc private func menuRestart() { restartApp() }
     @objc private func menuQuit() { NSApp.terminate(nil) }
 
     func applicationWillTerminate(_ notification: Notification) {

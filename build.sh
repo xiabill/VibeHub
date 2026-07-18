@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 APP_NAME="VibeHub"
 APP_BUNDLE="${APP_NAME}.app"
 BUNDLE_ID="com.xiabill.VibeHub"
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 # 1. 生成图标（不存在时）
 if [[ ! -f AppIcon.icns ]]; then
