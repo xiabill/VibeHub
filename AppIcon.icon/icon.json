@@ -1,0 +1,81 @@
+{
+  "fill" : {
+    "solid" : "srgb:0.31000,0.27500,0.89800,1.00000"
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "glass" : false,
+          "hidden" : false,
+          "image-name-specializations" : [
+            {
+              "value" : "wave-light.png"
+            },
+            {
+              "appearance" : "dark",
+              "value" : "wave-dark.png"
+            }
+          ],
+          "name" : "waveform"
+        }
+      ],
+      "shadow" : {
+        "kind" : "none",
+        "opacity" : 0.5
+      },
+      "specular" : false
+    },
+    {
+      "layers" : [
+        {
+          "glass" : false,
+          "hidden" : false,
+          "image-name-specializations" : [
+            {
+              "value" : "cap-light.png"
+            },
+            {
+              "appearance" : "dark",
+              "value" : "cap-dark.png"
+            }
+          ],
+          "name" : "keycap"
+        }
+      ],
+      "shadow" : {
+        "kind" : "none",
+        "opacity" : 0.5
+      },
+      "specular" : false
+    },
+    {
+      "layers" : [
+        {
+          "glass" : false,
+          "hidden" : false,
+          "image-name-specializations" : [
+            {
+              "value" : "bg-light.png"
+            },
+            {
+              "appearance" : "dark",
+              "value" : "bg-dark.png"
+            }
+          ],
+          "name" : "background"
+        }
+      ],
+      "shadow" : {
+        "kind" : "none",
+        "opacity" : 0.5
+      },
+      "specular" : false
+    }
+  ],
+  "supported-platforms" : {
+    "squares" : [
+      "macOS"
+    ]
+  }
+}

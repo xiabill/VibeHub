@@ -41,8 +41,16 @@ if [[ ! -f "$ARTIFACT_DIR/VibeHub" ]]; then
 fi
 
 # 3. 本地签名打包（复用 build.sh，跳过编译）
+#    Assets.car（CI actool 编的深色/浅色图标）若存在则一并打入
+ASSETS_CAR_ARG=""
+if [[ -f "$ARTIFACT_DIR/Assets.car" ]]; then
+  echo "→ 检测到 Assets.car（macOS 26 分层图标）"
+  ASSETS_CAR_ARG="$ARTIFACT_DIR/Assets.car"
+else
+  echo "⚠️  产物中无 Assets.car，图标走 icns 兜底（macOS 26 深色模式可能失控）" >&2
+fi
 echo "→ 本地签名打包…"
-PREBUILT_BINARY="$ARTIFACT_DIR/VibeHub" ./build.sh
+PREBUILT_BINARY="$ARTIFACT_DIR/VibeHub" PREBUILT_ASSETS_CAR="$ASSETS_CAR_ARG" ./build.sh
 
 # 4. 确认签名 identity 非 ad-hoc
 echo "→ 检查签名…"
