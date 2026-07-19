@@ -880,7 +880,17 @@ final class RemoteEngine: ObservableObject {
     struct LearnedUsage: Equatable { let page: UInt32; let usage: UInt32 }
     @Published var isLearning = false
     @Published var learnedUsage: LearnedUsage?
+    @Published var learnDuplicate: String?   // 学习时命中已存在按键 → 该按键 label（提示重复）
     private var learnTimer: Timer?
+
+    // —— 按下反馈 / 最近按键回显（HID 回调在主 runloop，@Published 更新安全）——
+    struct LastHIDEvent { let usagePage: UInt32; let usage: UInt32; let buttonLabel: String? }
+    @Published var pressedButtonIds: Set<String> = []   // 仅对已知按键维护，抬起移除
+    @Published var lastHIDEvent: LastHIDEvent?
+
+    /// 面板打开期间为 true：仍吞原生事件、仍更新回显，但不执行绑定 chord / auto-repeat。
+    /// 非 @Published，只在主线程读写（AppDelegate 管理生命周期）。
+    var panelVisible = false
 
     private var manager: IOHIDManager?
     private var openedDevices: Set<IOHIDDevice> = []
@@ -1032,6 +1042,7 @@ final class RemoteEngine: ObservableObject {
         stopAllAutoRepeats()
         clearSwallows()
         stopLearning()
+        pressedButtonIds.removeAll()
         if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
         if let src = tapRunLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes) }
         eventTap = nil
@@ -1074,6 +1085,7 @@ final class RemoteEngine: ObservableObject {
         // 同理：isDown 时加进 swallowSet 的条目等不到 key-up 的延迟摘除，
         // 不清掉会永久吞真实键盘的同键码事件（与 stop() 的配对做法一致）。
         clearSwallows()
+        pressedButtonIds.removeAll()   // 拔出时清空按下高亮，防残留（HID 回调在主 runloop）
         DispatchQueue.main.async { [weak self] in
             self?.deviceConnected = !(self?.openedDevices.isEmpty ?? true)
         }
@@ -1082,7 +1094,13 @@ final class RemoteEngine: ObservableObject {
     // HID 回调在主 runloop（IOHIDManagerScheduleWithRunLoop main），@Published 更新安全。
     func startLearning() {
         learnedUsage = nil
+        learnDuplicate = nil
         isLearning = true
+        armLearnTimeout()
+    }
+
+    /// 装/重置 10 秒学习超时（命中重复按键时也重置，给用户重新按的机会）。
+    private func armLearnTimeout() {
         learnTimer?.invalidate()
         learnTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: false) { [weak self] _ in
             self?.stopLearning()
@@ -1091,6 +1109,7 @@ final class RemoteEngine: ObservableObject {
 
     func stopLearning() {
         isLearning = false
+        learnDuplicate = nil
         learnTimer?.invalidate()
         learnTimer = nil
     }
@@ -1100,19 +1119,37 @@ final class RemoteEngine: ObservableObject {
         let usagePage = IOHIDElementGetUsagePage(element)
         let usage = IOHIDElementGetUsage(element)
         let intValue = IOHIDValueGetIntegerValue(value)
+        let isDown = (intValue != 0)
+
+        // 噪声：键盘页 reserved/rollover(<0x04) 与修饰键(0xE0-0xE7)、usage 0。这些不回显也不学习。
+        let isNoise = usage == 0
+            || (usagePage == 0x07 && (usage < 0x04 || (usage >= 0xE0 && usage <= 0xE7)))
+        let known = remoteButton(usagePage: usagePage, usage: usage)
+
+        // 回显与按下高亮：无论是否在列表 / 是否学习态都更新 lastHIDEvent（已知给 label，未知给 nil）；
+        // pressedButtonIds 只对已知按键维护。
+        if isDown && !isNoise {
+            lastHIDEvent = LastHIDEvent(usagePage: usagePage, usage: usage, buttonLabel: known?.label)
+        }
+        if let button = known {
+            if isDown { pressedButtonIds.insert(button.id) } else { pressedButtonIds.remove(button.id) }
+        }
+
         // 学习态只拦截按下(value!=0)：key-up 必须放行到正常 dispatch，
         // 否则学习前按住的键抬起被吞，auto-repeat 停不下来、swallowSet 残留。
-        if isLearning, intValue != 0 {
-            // 过滤噪声：键盘页 reserved/rollover(<0x04) 和修饰键(0xE0-0xE7)、usage 0、已存在的按键
-            if usagePage == 0x07, usage < 0x04 || (usage >= 0xE0 && usage <= 0xE7) { return }
-            if usage == 0 { return }
-            if remoteButton(usagePage: usagePage, usage: usage) != nil { return }
+        if isLearning, isDown {
+            if isNoise { return }
+            if known != nil {                    // 命中已存在按键 → 提示重复，保持学习态并重置超时
+                learnDuplicate = known?.label
+                armLearnTimeout()
+                return
+            }
+            learnDuplicate = nil
             learnedUsage = LearnedUsage(page: usagePage, usage: usage)
             stopLearning()
             return  // 学习态下不 dispatch
         }
-        guard let button = remoteButton(usagePage: usagePage, usage: usage) else { return }
-        let isDown = (intValue != 0)
+        guard let button = known else { return }
         dispatch(button: button, isDown: isDown)
     }
 
@@ -1132,11 +1169,14 @@ final class RemoteEngine: ObservableObject {
             }
         }
         if isDown {
+            // 面板打开时：swallow 已处理（吞掉 OK→Enter 等原生事件），但不执行绑定，
+            // 否则切窗/Enter 会抢焦点、把 transient popover 自动关掉、打断输名字。
+            if panelVisible { return }
             postChordDownAsync(keyIds: mapping.keys)
             postChordUpAsync(keyIds: mapping.keys)
             startAutoRepeat(buttonId: button.id, keys: mapping.keys)
         } else {
-            stopAutoRepeat(buttonId: button.id)
+            stopAutoRepeat(buttonId: button.id)  // 抬起始终停 repeat（含面板打开前已启动的）
         }
     }
 
@@ -1241,6 +1281,7 @@ struct KeyPickerRow: View {
     let showModePicker: Bool  // AirPods=true（点按/按住），Remote=false
     let rowId: String
     @Binding var recordingRowId: String?
+    var isPressed: Bool = false   // Remote：该按键此刻被按下 → 行背景闪 accent
 
     @StateObject private var recorder = KeyRecorder()
 
@@ -1263,6 +1304,9 @@ struct KeyPickerRow: View {
             recordButton
             manualMenu
         }
+        .padding(.horizontal, 4).padding(.vertical, 1)
+        .background(RoundedRectangle(cornerRadius: 5)
+            .fill(Color.accentColor.opacity(isPressed ? 0.2 : 0)))
         .onChange(of: isRecording) { rec in
             if rec {
                 recorder.start(
@@ -1482,14 +1526,13 @@ struct AirPodsTabView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 10) {
-                moduleCard
-                PermissionCard(specs: [.accessibility])
-                bindingsCard
-            }
-            .padding(12)
+        VStack(spacing: 10) {
+            moduleCard
+            PermissionCard(specs: [.accessibility])
+            bindingsCard
         }
+        .padding(12)
+        .frame(width: 360, alignment: .top)
     }
 
     private var moduleCard: some View {
@@ -1601,16 +1644,15 @@ struct RemoteTabView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 10) {
-                moduleCard
-                PermissionCard(specs: [.accessibility, .inputMonitoring])
-                bindingsCard
-                deviceCard
-                advancedCard
-            }
-            .padding(12)
+        VStack(spacing: 10) {
+            moduleCard
+            PermissionCard(specs: [.accessibility, .inputMonitoring])
+            bindingsCard
+            deviceCard
+            advancedCard
         }
+        .padding(12)
+        .frame(width: 360, alignment: .top)
     }
 
     // —— 模块卡 ——
@@ -1702,7 +1744,8 @@ struct RemoteTabView: View {
             if let b = remoteButtons.first(where: { $0.id == id }) {
                 KeyPickerRow(label: b.label, labelWidth: 68,
                     mapping: config.binding(for: id), showModePicker: false,
-                    rowId: "rm-\(id)", recordingRowId: $recordingRowId)
+                    rowId: "rm-\(id)", recordingRowId: $recordingRowId,
+                    isPressed: engine.pressedButtonIds.contains(id))
             }
         }
     }
@@ -1726,13 +1769,15 @@ struct RemoteTabView: View {
                     .font(.caption2).foregroundColor(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            lastKeyRow
             Divider()
             Text("自定义按键").font(.caption2).foregroundColor(.secondary)
             ForEach(config.customButtons) { c in
                 HStack(spacing: 4) {
                     KeyPickerRow(label: c.label, labelWidth: 68,
                         mapping: config.binding(for: c.id), showModePicker: false,
-                        rowId: "rm-\(c.id)", recordingRowId: $recordingRowId)
+                        rowId: "rm-\(c.id)", recordingRowId: $recordingRowId,
+                        isPressed: engine.pressedButtonIds.contains(c.id))
                     Button { config.removeCustomButton(c.id) } label: {
                         Image(systemName: "trash")
                     }
@@ -1742,6 +1787,31 @@ struct RemoteTabView: View {
             learnControls
         }
         .vhCard()
+    }
+
+    /// 最近按键回显 + 常驻提示：已知给 label+usage，未知给橙色发现提示，无事件给灰字。
+    @ViewBuilder private var lastKeyRow: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .top, spacing: 4) {
+                Text("最近按键").font(.caption2).foregroundColor(.secondary)
+                if let e = engine.lastHIDEvent {
+                    if let lbl = e.buttonLabel {
+                        Text(String(format: "%@ (0x%02X:0x%02X)", lbl, e.usagePage, e.usage))
+                            .font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
+                    } else {
+                        Text(String(format: "未知按键 0x%02X:0x%02X — 可通过下方「学习新按键」添加",
+                                    e.usagePage, e.usage))
+                            .font(.caption2).foregroundColor(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else {
+                    Text("按一下遥控器试试").font(.caption2).foregroundColor(.secondary)
+                }
+                Spacer(minLength: 0)
+            }
+            Text("面板打开时按键不执行绑定（配置模式）")
+                .font(.caption2).foregroundColor(.secondary)
+        }
     }
 
     private var deviceMenu: some View {
@@ -1776,13 +1846,20 @@ struct RemoteTabView: View {
 
     @ViewBuilder private var learnControls: some View {
         if engine.isLearning {
-            HStack(spacing: 6) {
-                ProgressView().controlSize(.small)
-                Text("请按下遥控器上要添加的按键…（10 秒）")
-                    .font(.caption).foregroundColor(.secondary)
-                Spacer()
-                Button("取消") { engine.stopLearning() }
-                    .buttonStyle(.borderless).font(.caption)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("请按下遥控器上要添加的按键…（10 秒）")
+                        .font(.caption).foregroundColor(.secondary)
+                    Spacer()
+                    Button("取消") { engine.stopLearning() }
+                        .buttonStyle(.borderless).font(.caption)
+                }
+                if let dup = engine.learnDuplicate {
+                    Text("该按键已存在：\(dup)，请按其他键")
+                        .font(.caption2).foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         } else if let lu = engine.learnedUsage {
             VStack(alignment: .leading, spacing: 4) {
@@ -1891,7 +1968,7 @@ struct ContentView: View {
                     .opacity(selectedTab == "remote" ? 1 : 0)
                     .allowsHitTesting(selectedTab == "remote")
             }
-            .frame(width: 360, height: 620)
+            .frame(width: 360)
 
             Divider()
 
@@ -1927,7 +2004,7 @@ struct ContentView: View {
 
 // MARK: - AppDelegate（状态栏 + 弹层 + 右键菜单）
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private var cancellables = Set<AnyCancellable>()
@@ -1977,13 +2054,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover = NSPopover()
         popover.behavior = .transient
         popover.animates = false  // 关掉默认 ~200ms 弹出动画，状态栏点击立即响应
+        popover.delegate = self   // popoverDidClose → panelVisible = false
 
         // 预热：先把 host 挂到一个屏外隐藏 window 里强制 SwiftUI 渲染整棵树，
         // 然后再交给 popover。否则 SwiftUI 只在视图真正进入 window 时才 build body，
         // 首次点击图标时要现场建整棵树。
+        // sizingOptions=.preferredContentSize 让 host 把 SwiftUI 理想高度同步给 popover（面板自适应高度）。
         let host = NSHostingController(rootView: ContentView())
+        host.sizingOptions = [.preferredContentSize]
         let warmup = NSWindow(
-            contentRect: NSRect(x: -50000, y: -50000, width: 360, height: 720),
+            contentRect: NSRect(x: -50000, y: -50000, width: 360, height: 900),
             styleMask: [.borderless], backing: .buffered, defer: false)
         warmup.alphaValue = 0
         warmup.contentViewController = host
@@ -2053,10 +2133,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func togglePopover(_ sender: Any?) {
         guard let button = statusItem.button else { return }
         if popover.isShown {
-            popover.performClose(sender)
+            popover.performClose(sender)   // → popoverDidClose 置 panelVisible = false
         } else {
+            RemoteEngine.shared.panelVisible = true
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
+    }
+
+    // transient 自动关 / performClose 都会回调这里：面板不可见后恢复按键执行绑定。
+    func popoverDidClose(_ notification: Notification) {
+        RemoteEngine.shared.panelVisible = false
     }
 
     private func showContextMenu(from button: NSStatusBarButton, event: NSEvent) {
