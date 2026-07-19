@@ -6,6 +6,8 @@ import CoreGraphics
 import Combine
 import ServiceManagement
 import Darwin
+import CoreAudio
+import AVFoundation
 
 // MARK: - 共享：按键目录（chord 目标按键可选项）
 
@@ -1208,6 +1210,116 @@ final class RemoteEngine: ObservableObject {
     }
 }
 
+// MARK: - 共享：系统麦克风输入监测（当前输入设备 + 按需电平表）
+
+/// 只读展示"系统默认输入设备"名称/UID（纯 CoreAudio 属性，不开麦、不需权限），
+/// 并提供按需的麦克风电平测试（点一下才开麦，超时/停止自动关，把对遥控器自带 mic
+/// 断流特性的影响降到最低）。
+final class AudioInputMonitor: ObservableObject {
+    static let shared = AudioInputMonitor()
+
+    @Published private(set) var inputName: String = "—"
+    @Published private(set) var inputUID: String = ""
+    @Published private(set) var isTesting = false
+    @Published private(set) var level: Float = 0      // 0...1 归一化电平
+    @Published private(set) var testError: String?
+
+    private var engine: AVAudioEngine?
+    private var timeoutItem: DispatchWorkItem?
+    private var defaultInputAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+
+    private init() {
+        refresh()
+        // 系统默认输入设备变化时实时刷新显示
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &defaultInputAddr, DispatchQueue.main
+        ) { [weak self] _, _ in self?.refresh() }
+    }
+
+    /// 刷新"当前系统默认输入设备"名称 + UID。纯只读属性，不激活麦克风。
+    func refresh() {
+        var devID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let st = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                            &defaultInputAddr, 0, nil, &size, &devID)
+        guard st == noErr, devID != 0 else {
+            inputName = "（无输入设备）"; inputUID = ""; return
+        }
+        inputName = deviceString(devID, kAudioObjectPropertyName) ?? "未知设备"
+        inputUID  = deviceString(devID, kAudioDevicePropertyDeviceUID) ?? ""
+    }
+
+    private func deviceString(_ dev: AudioDeviceID, _ selector: AudioObjectPropertySelector) -> String? {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var value: CFString? = nil
+        var size = UInt32(MemoryLayout<CFString?>.size)
+        guard AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &value) == noErr else { return nil }
+        return value as String?
+    }
+
+    /// 按需开麦测电平：先请求麦克风权限，授权后启动 AVAudioEngine 读 RMS。
+    func startTest() {
+        guard !isTesting else { return }
+        testError = nil
+        AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if granted { self.beginEngine() }
+                else { self.testError = "麦克风权限被拒绝：系统设置 → 隐私与安全性 → 麦克风 开启 VibeHub" }
+            }
+        }
+    }
+
+    private func beginEngine() {
+        refresh()
+        let eng = AVAudioEngine()
+        let input = eng.inputNode
+        let fmt = input.inputFormat(forBus: 0)
+        guard fmt.sampleRate > 0, fmt.channelCount > 0 else {
+            testError = "无法读取输入设备格式（设备可能未就绪或被占用）"; return
+        }
+        input.installTap(onBus: 0, bufferSize: 1024, format: fmt) { [weak self] buffer, _ in
+            guard let ch = buffer.floatChannelData?[0] else { return }
+            let n = Int(buffer.frameLength)
+            if n == 0 { return }
+            var sum: Float = 0
+            for i in 0..<n { let s = ch[i]; sum += s * s }
+            let rms = sqrtf(sum / Float(n))
+            let db = 20 * log10f(max(rms, 1e-7))
+            let norm = max(0, min(1, (db + 60) / 60))   // -60dB..0dB → 0..1
+            DispatchQueue.main.async { self?.level = norm }
+        }
+        do {
+            try eng.start()
+            engine = eng
+            isTesting = true
+            // 15 秒自动停（遥控器自带 mic 撑不了太久，测试用够了）
+            let item = DispatchWorkItem { [weak self] in self?.stopTest() }
+            timeoutItem = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: item)
+        } catch {
+            testError = "启动麦克风失败：\(error.localizedDescription)"
+        }
+    }
+
+    func stopTest() {
+        timeoutItem?.cancel(); timeoutItem = nil
+        if let eng = engine {
+            eng.inputNode.removeTap(onBus: 0)
+            eng.stop()
+        }
+        engine = nil
+        isTesting = false
+        level = 0
+    }
+}
+
 // MARK: - 开机自启动
 
 final class LaunchAtLogin: ObservableObject {
@@ -1612,6 +1724,7 @@ struct AirPodsTabView: View {
 struct RemoteTabView: View {
     @ObservedObject var config = RemoteConfig.shared
     @ObservedObject var engine = RemoteEngine.shared
+    @ObservedObject var audio = AudioInputMonitor.shared
     @Binding var recordingRowId: String?
     @State private var detectedDevices: [DetectedDevice] = []
     @State private var learnName: String = ""
@@ -1649,6 +1762,7 @@ struct RemoteTabView: View {
             PermissionCard(specs: [.accessibility, .inputMonitoring])
             bindingsCard
             deviceCard
+            micCard
             advancedCard
         }
         .padding(12)
@@ -1931,6 +2045,96 @@ struct RemoteTabView: View {
             }
         }
         .vhCard()
+    }
+
+    // —— 麦克风输入卡 ——
+
+    private var micCard: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("麦克风输入").font(.subheadline.weight(.semibold))
+                Spacer()
+                if audio.isTesting {
+                    Button("停止") { audio.stopTest() }
+                        .buttonStyle(.borderless).font(.caption)
+                } else {
+                    Button {
+                        scanDevicesAsync()   // 刷新 HID 名，供是否遥控器匹配
+                        audio.startTest()
+                    } label: {
+                        Label("测试麦克风", systemImage: "mic")
+                    }.buttonStyle(.borderless).font(.caption)
+                }
+            }
+            // 当前系统默认输入设备 + 是否遥控器徽标
+            HStack(spacing: 6) {
+                Image(systemName: "waveform").font(.caption).foregroundColor(.secondary)
+                Text(audio.inputName)
+                    .font(.system(size: 11, design: .monospaced))
+                    .lineLimit(1).truncationMode(.middle)
+                if inputLooksLikeRemote {
+                    Text("遥控器").font(.caption2)
+                        .padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(Color.green.opacity(0.18))
+                        .foregroundColor(.green).cornerRadius(3)
+                }
+                Spacer(minLength: 0)
+            }
+            Text(inputLooksLikeRemote
+                 ? "当前系统输入正是这个遥控器的麦克风"
+                 : "当前系统输入不是遥控器（或设备名未能匹配）")
+                .font(.caption2).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            // 电平表（仅测试期间）
+            if audio.isTesting {
+                VStack(alignment: .leading, spacing: 3) {
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            RoundedRectangle(cornerRadius: 3).fill(Color.secondary.opacity(0.15))
+                            RoundedRectangle(cornerRadius: 3)
+                                .fill(audio.level > 0.02 ? Color.green : Color.secondary.opacity(0.4))
+                                .frame(width: max(2, geo.size.width * CGFloat(audio.level)))
+                        }
+                    }
+                    .frame(height: 8)
+                    Text("对着遥控器说话，绿条应随声音跳动（15 秒后自动停）")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+            }
+            if let err = audio.testError {
+                Text(err).font(.caption2).foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .vhCard()
+        .onAppear { audio.refresh() }
+        .onDisappear { audio.stopTest() }
+    }
+
+    /// best-effort 判断"系统默认输入设备是不是当前目标遥控器"。
+    /// 先看设备 UID 里是否同时含目标 VID+PID 的 hex（强信号），再退到设备名/厂商名模糊匹配。
+    // ponytail: 名称启发式，跨设备命名不一致可能漏判；漏判时只是不显示徽标，不会误接管。
+    private var inputLooksLikeRemote: Bool {
+        let uid = audio.inputUID.lowercased()
+        if !uid.isEmpty {
+            let vidHex = String(format: "%04x", config.targetVID)
+            let pidHex = String(format: "%04x", config.targetPID)
+            if uid.contains(vidHex) && uid.contains(pidHex) { return true }
+        }
+        let inNorm = normalizeName(audio.inputName)
+        guard !inNorm.isEmpty else { return false }
+        let target = detectedDevices.first {
+            $0.vendorId == config.targetVID && $0.productId == config.targetPID
+        }
+        for cand in [target?.product, target?.manufacturer].compactMap({ $0 }) {
+            let c = normalizeName(cand)
+            if c.count >= 3 && (inNorm.contains(c) || c.contains(inNorm)) { return true }
+        }
+        return false
+    }
+
+    private func normalizeName(_ s: String) -> String {
+        s.lowercased().filter { $0.isLetter || $0.isNumber }
     }
 }
 

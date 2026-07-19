@@ -24,6 +24,7 @@ jobs:
             -target arm64-apple-macos13.0 \
             -framework Cocoa -framework SwiftUI -framework CoreGraphics \
             -framework ServiceManagement -framework IOKit \
+            -framework AVFoundation -framework CoreAudio \
             VibeHub.swift \
             -o VibeHub
 
