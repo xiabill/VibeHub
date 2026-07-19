@@ -696,6 +696,17 @@ func customToRemoteButton(_ c: CustomRemoteButton) -> RemoteButton {
                  passthrough: inferPassthrough(usagePage: c.usagePage, usage: c.usage))
 }
 
+/// 自动收录白名单：只把"看起来是真实按键"的 usage 当新按键。
+/// 遥控器真实按键都落在 Keyboard(0x07) 实体键区或 Consumer(0x0C) 控件区；
+/// 复合设备一次按键常在 vendor / generic-desktop 页附带影子 element，这些一律不收录。
+func isRealButtonUsage(usagePage: UInt32, usage: UInt32) -> Bool {
+    switch usagePage {
+    case 0x07: return usage >= 0x04 && usage <= 0xA4       // Keyboard/Keypad 实体键（排除 modifier/reserved）
+    case 0x0C: return usage >= 0x20 && usage <= 0x2FF       // Consumer 控件
+    default:   return false
+    }
+}
+
 /// 先查硬编码 12 颗按键，未命中再查用户自定义按键。
 func remoteButton(usagePage: UInt32, usage: UInt32) -> RemoteButton? {
     if let b = buttonByUsage[UInt64(usagePage) << 32 | UInt64(usage)] { return b }
@@ -837,6 +848,14 @@ final class RemoteConfig: ObservableObject {
         RemoteEngine.shared.stopAutoRepeat(buttonId: id)
     }
 
+    /// 一键清空所有自定义按键（及其映射、残留 auto-repeat）。
+    func clearAllCustomButtons() {
+        let ids = customButtons.map { $0.id }
+        for id in ids { RemoteEngine.shared.stopAutoRepeat(buttonId: id) }
+        customButtons.removeAll()
+        for id in ids { mappings.removeValue(forKey: id) }
+    }
+
     func resetToDefaults() {
         var fresh: [String: Mapping] = [:]
         for b in remoteButtons { fresh[b.id] = Mapping() }
@@ -941,6 +960,8 @@ final class RemoteEngine: ObservableObject {
     // 覆盖认不出 keycode 的冷门键。窗口过期自动失效（无需清理线程）。
     private var greedyUntil: CFAbsoluteTime = 0
     private let greedyLock = NSLock()
+    // 自动收录去抖：一次物理按键的复合上报只收第一个（HID 回调在主 runloop，无需锁）
+    private var lastAutoCaptureAt: CFAbsoluteTime = 0
     private func armGreedy(ms: Double) {
         greedyLock.lock(); greedyUntil = CFAbsoluteTimeGetCurrent() + ms / 1000.0; greedyLock.unlock()
     }
@@ -1230,8 +1251,12 @@ final class RemoteEngine: ObservableObject {
         if !isNoise {
             captureSwallow(usagePage: usagePage, usage: usage, isDown: isDown, known: known)
         }
-        // 面板打开时，未识别的新按键按下即自动收录，随后用户在列表里改名 + 配功能
-        if known == nil, isDown, !isNoise, panelVisible {
+        // 面板打开时，未识别的新按键按下即自动收录，随后用户在列表里改名 + 配功能。
+        // 白名单挡掉复合设备的影子 usage，去抖挡掉同一次按键的多 element 上报。
+        if known == nil, isDown, panelVisible,
+           isRealButtonUsage(usagePage: usagePage, usage: usage),
+           CFAbsoluteTimeGetCurrent() - lastAutoCaptureAt > 0.3 {
+            lastAutoCaptureAt = CFAbsoluteTimeGetCurrent()
             let hex = String(format: "0x%02X:0x%02X", usagePage, usage)
             RemoteConfig.shared.addCustomButton(label: "新按键 \(hex)",
                                                 usagePage: usagePage, usage: usage)
@@ -1806,6 +1831,7 @@ struct RemoteTabView: View {
     @State private var detectedDevices: [DetectedDevice] = []
     @State private var learnName: String = ""
     @State private var actionMsg: String?
+    @State private var confirmClearCustom = false
 
     private let groupDpad   = ["up", "down", "left", "right", "ok", "menu"]
     private let groupSystem = ["home", "back", "voice"]
@@ -1962,32 +1988,42 @@ struct RemoteTabView: View {
             }
             lastKeyRow
             Divider()
-            Text("自定义按键").font(.caption2).foregroundColor(.secondary)
+            HStack(spacing: 4) {
+                Text("自定义按键").font(.caption2).foregroundColor(.secondary)
+                Spacer()
+                if !config.customButtons.isEmpty {
+                    Button(role: .destructive) { confirmClearCustom = true } label: {
+                        Label("清空", systemImage: "trash")
+                    }.buttonStyle(.borderless).font(.caption)
+                }
+            }
             Text("面板打开时按遥控器上未收录的键，会自动加到这里。改名并配好功能即可。")
                 .font(.caption2).foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             ForEach(config.customButtons) { c in
-                VStack(spacing: 2) {
-                    HStack(spacing: 4) {
-                        TextField("按键名称", text: config.customLabelBinding(c.id))
-                            .textFieldStyle(.roundedBorder).controlSize(.small)
-                        Text(String(format: "0x%02X:0x%02X", c.usagePage, c.usage))
-                            .font(.system(size: 9, design: .monospaced)).foregroundColor(.secondary)
-                        Button { config.removeCustomButton(c.id) } label: {
-                            Image(systemName: "trash")
-                        }
-                        .buttonStyle(.borderless).help("删除此自定义按键")
-                    }
+                HStack(spacing: 4) {
+                    TextField("名称", text: config.customLabelBinding(c.id))
+                        .textFieldStyle(.roundedBorder).controlSize(.small)
+                        .frame(width: 84)
                     KeyPickerRow(label: "", labelWidth: 0,
                         mapping: config.binding(for: c.id), showModePicker: false,
                         rowId: "rm-\(c.id)", recordingRowId: $recordingRowId,
                         isPressed: engine.pressedButtonIds.contains(c.id))
+                    Button { config.removeCustomButton(c.id) } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.borderless).help("删除此自定义按键")
                 }
-                .padding(.vertical, 2)
             }
             learnControls
         }
         .vhCard()
+        .confirmationDialog("清空所有自定义按键？", isPresented: $confirmClearCustom, titleVisibility: .visible) {
+            Button("删除全部 \(config.customButtons.count) 个", role: .destructive) {
+                config.clearAllCustomButtons()
+            }
+            Button("取消", role: .cancel) {}
+        }
     }
 
     /// 最近按键回显 + 常驻提示：已知给 label+usage，未知给橙色发现提示，无事件给灰字。
