@@ -1513,16 +1513,28 @@ struct KeyPickerRow: View {
     var labelBinding: Binding<String>? = nil   // 非 nil 时 label 位渲染可编辑名称框（自定义按键用）
 
     @StateObject private var recorder = KeyRecorder()
+    @State private var editName = ""
+    @FocusState private var nameFocused: Bool
 
     private var isRecording: Bool { recordingRowId == rowId }
+
+    /// 名称提交：仅在回车 / 失焦时写回 config，避免每字符改 @Published 触发全量重算把框顶掉。
+    private func commitName() {
+        guard let lb = labelBinding, lb.wrappedValue != editName else { return }
+        lb.wrappedValue = editName
+    }
 
     var body: some View {
         HStack(spacing: 6) {
             Toggle("", isOn: $mapping.enabled).labelsHidden().controlSize(.small)
-            if let lb = labelBinding {
-                TextField("名称", text: lb)
+            if labelBinding != nil {
+                TextField("名称", text: $editName)
                     .textFieldStyle(.roundedBorder).controlSize(.small)
                     .frame(width: labelWidth)
+                    .focused($nameFocused)
+                    .onSubmit { commitName() }
+                    .onChange(of: nameFocused) { focused in if !focused { commitName() } }
+                    .onAppear { editName = labelBinding?.wrappedValue ?? "" }
             } else {
                 Text(label).frame(width: labelWidth, alignment: .leading).font(.system(size: 12))
             }
@@ -1559,6 +1571,7 @@ struct KeyPickerRow: View {
         .onDisappear {
             if isRecording { recordingRowId = nil }  // popover 关闭强制取消
             recorder.stop()
+            commitName()   // 关面板时保存未提交的改名
         }
     }
 
@@ -1621,6 +1634,12 @@ struct KeyPickerRow: View {
             }
             Divider()
             Button("追加按键") { mapping.keys.append("lopt") }
+            if !mapping.keys.isEmpty {
+                Button("清除绑定", role: .destructive) {
+                    mapping.keys = []
+                    mapping.enabled = false
+                }
+            }
         } label: {
             Image(systemName: "ellipsis")
         }
