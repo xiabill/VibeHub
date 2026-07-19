@@ -758,6 +758,7 @@ final class RemoteConfig: ObservableObject {
     private let arEnabledKey     = "vibehub_remote_autorepeat_enabled"
     private let arInitialMsKey   = "vibehub_remote_autorepeat_initial_ms"
     private let arIntervalMsKey  = "vibehub_remote_autorepeat_interval_ms"
+    private let captureAllKey    = "vibehub_remote_capture_all"
     private let vidKey           = "vibehub_remote_target_vid"
     private let pidKey           = "vibehub_remote_target_pid"
     private let customKey        = "vibehub_remote_custom_v1"
@@ -775,6 +776,10 @@ final class RemoteConfig: ObservableObject {
     }
     @Published var autoRepeatIntervalMs: Int {
         didSet { UserDefaults.standard.set(autoRepeatIntervalMs, forKey: arIntervalMsKey) }
+    }
+    /// 全吞模式：开启后遥控器任意键（含未映射 / 未识别）的系统原生行为都被吞掉。
+    @Published var captureAllKeys: Bool {
+        didSet { UserDefaults.standard.set(captureAllKeys, forKey: captureAllKey) }
     }
     @Published var targetVID: Int { didSet { UserDefaults.standard.set(targetVID, forKey: vidKey) } }
     @Published var targetPID: Int { didSet { UserDefaults.standard.set(targetPID, forKey: pidKey) } }
@@ -798,6 +803,7 @@ final class RemoteConfig: ObservableObject {
         self.autoRepeatEnabled        = (d.object(forKey: arEnabledKey)   as? Bool) ?? true
         self.autoRepeatInitialDelayMs = (d.object(forKey: arInitialMsKey) as? Int)  ?? 500
         self.autoRepeatIntervalMs     = (d.object(forKey: arIntervalMsKey) as? Int) ?? 100
+        self.captureAllKeys           = (d.object(forKey: captureAllKey) as? Bool) ?? true
         self.targetVID                = (d.object(forKey: vidKey) as? Int) ?? DEFAULT_TARGET_VID
         self.targetPID                = (d.object(forKey: pidKey) as? Int) ?? DEFAULT_TARGET_PID
     }
@@ -839,6 +845,7 @@ final class RemoteConfig: ObservableObject {
         autoRepeatEnabled = true
         autoRepeatInitialDelayMs = 500
         autoRepeatIntervalMs = 100
+        captureAllKeys = true
         targetVID = DEFAULT_TARGET_VID
         targetPID = DEFAULT_TARGET_PID
     }
@@ -913,14 +920,66 @@ final class RemoteEngine: ObservableObject {
         swallowLock.lock(); defer { swallowLock.unlock() }
         return swallowSet.contains(k)
     }
-    private func clearSwallows() { swallowLock.lock(); swallowSet.removeAll(); swallowLock.unlock() }
+    private func clearSwallows() {
+        swallowLock.lock(); swallowSet.removeAll(); swallowLock.unlock()
+        greedyLock.lock(); greedyUntil = 0; greedyLock.unlock()
+    }
+
+    // 全吞兜底：遥控器一有按键动作就开一个极短窗，窗口内吞掉一切非自家事件，
+    // 覆盖认不出 keycode 的冷门键。窗口过期自动失效（无需清理线程）。
+    private var greedyUntil: CFAbsoluteTime = 0
+    private let greedyLock = NSLock()
+    private func armGreedy(ms: Double) {
+        greedyLock.lock(); greedyUntil = CFAbsoluteTimeGetCurrent() + ms / 1000.0; greedyLock.unlock()
+    }
+    private func inGreedyWindow() -> Bool {
+        greedyLock.lock(); defer { greedyLock.unlock() }
+        return CFAbsoluteTimeGetCurrent() < greedyUntil
+    }
 
     private func swallowKey(for button: RemoteButton) -> SwallowKey? {
-        switch button.passthrough {
+        return swallowKey(forPassthrough: button.passthrough)
+    }
+
+    private func swallowKey(forPassthrough pt: PassthroughKind) -> SwallowKey? {
+        switch pt {
         case .keyboard(let kc): return .keyboard(Int64(kc))
         case .consumer(let kt): return .consumer(kt)
         case .none:             return nil
         }
+    }
+
+    /// keydown 时登记吞键，keyup 时 100ms 延迟摘除（吞掉系统"按起"与 auto-repeat 残留）。
+    private func applySwallow(_ sk: SwallowKey, isDown: Bool) {
+        if isDown {
+            addSwallow(sk)
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                self?.removeSwallow(sk)
+            }
+        }
+    }
+
+    /// 登记吞键（与"执行 chord"解耦）。
+    /// - 全吞开启：任意非噪声键都吞——能算出 keycode/consumer 的走精确 swallowSet（低误伤），
+    ///   同时开短窗贪吞兜底认不出的键。
+    /// - 全吞关闭：退回旧行为，仅对"已启用且已绑定"的已知键吞。
+    private func captureSwallow(usagePage: UInt32, usage: UInt32, isDown: Bool, known: RemoteButton?) {
+        let cfg = RemoteConfig.shared
+        guard cfg.captureAllKeys else {
+            if let b = known {
+                let m = cfg.mappings[b.id] ?? Mapping()
+                if m.enabled, !m.keys.isEmpty, let sk = swallowKey(for: b) {
+                    applySwallow(sk, isDown: isDown)
+                }
+            }
+            return
+        }
+        let pt = known?.passthrough ?? inferPassthrough(usagePage: usagePage, usage: usage)
+        if let sk = swallowKey(forPassthrough: pt) {
+            applySwallow(sk, isDown: isDown)
+        }
+        armGreedy(ms: 40)
     }
 
     @discardableResult
@@ -1025,6 +1084,10 @@ final class RemoteEngine: ObservableObject {
         // 自家事件直接放行（防止"OK→Enter 把自己也吞了"那类自吞 bug）
         if event.getIntegerValueField(.eventSourceUserData) == VH_EVENT_MAGIC {
             return Unmanaged.passUnretained(event)
+        }
+        // 全吞兜底：遥控器刚有按键动作，短窗内吞掉一切非自家事件（覆盖认不出 keycode 的键）
+        if inGreedyWindow(), type == .keyDown || type == .keyUp || type.rawValue == 14 {
+            return nil
         }
         if type == .keyDown || type == .keyUp {
             let kc = event.getIntegerValueField(.keyboardEventKeycode)
@@ -1151,6 +1214,10 @@ final class RemoteEngine: ObservableObject {
             stopLearning()
             return  // 学习态下不 dispatch
         }
+        // 登记吞键（与"执行 chord"解耦）：全吞模式下含未映射 / 未识别的键
+        if !isNoise {
+            captureSwallow(usagePage: usagePage, usage: usage, isDown: isDown, known: known)
+        }
         guard let button = known else { return }
         dispatch(button: button, isDown: isDown)
     }
@@ -1159,17 +1226,6 @@ final class RemoteEngine: ObservableObject {
         let cfg = RemoteConfig.shared
         let mapping = cfg.mappings[button.id] ?? Mapping()
         guard mapping.enabled, !mapping.keys.isEmpty else { return }
-        if let sk = swallowKey(for: button) {
-            if isDown {
-                addSwallow(sk)
-            } else {
-                let key = sk
-                // 100ms 延迟摘除，确保系统的"按起"事件（以及 auto-repeat 残留）都被吞掉
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                    self?.removeSwallow(key)
-                }
-            }
-        }
         if isDown {
             // 面板打开时：swallow 已处理（吞掉 OK→Enter 等原生事件），但不执行绑定，
             // 否则切窗/Enter 会抢焦点、把 transient popover 自动关掉、打断输名字。
@@ -2014,7 +2070,26 @@ struct RemoteTabView: View {
     // —— 高级卡 ——
 
     private var advancedCard: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text("完全接管遥控器").font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Toggle("", isOn: $config.captureAllKeys)
+                        .toggleStyle(.switch).labelsHidden().controlSize(.mini)
+                }
+                Text(config.captureAllKeys
+                     ? "遥控器所有按键（含未映射 / 未识别）的系统原生行为都被吞掉，只走你的映射。"
+                     : "仅吞掉已绑定按键的系统行为；未映射的键仍会触发系统。")
+                    .font(.caption2).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if config.captureAllKeys {
+                    Text("注意：按遥控器后约 40ms 内主键盘按下的键可能被一并吞掉（极少同时发生）；语音键触发的系统听写走私有路径无法拦截。")
+                        .font(.caption2).foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Divider()
             HStack {
                 Text("长按自动重复").font(.subheadline.weight(.semibold))
                 Spacer()
