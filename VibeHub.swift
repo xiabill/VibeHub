@@ -936,6 +936,7 @@ final class RemoteEngine: ObservableObject {
     private var openedDevices: Set<IOHIDDevice> = []
     private var eventTap: CFMachPort?
     private var tapRunLoopSource: CFRunLoopSource?
+    private var tapThread: Thread?   // CGEventTap 跑在专用后台线程，避免与主线程 SwiftUI 布局争抢
     private var repeatTimers: [String: Timer] = [:]
 
     enum SwallowKey: Hashable {
@@ -1102,10 +1103,21 @@ final class RemoteEngine: ObservableObject {
             userInfo: selfPtr
         ) else { return false }
         let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-        CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
-        CGEvent.tapEnable(tap: tap, enable: true)
         eventTap = tap
         tapRunLoopSource = src
+        // 专用后台线程跑 tap 的 runloop：吞键判断不再排在主线程 SwiftUI 布局后面，
+        // 避免面板打开时输入卡顿、tap 超时被系统 disable。
+        let t = Thread {
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
+            CGEvent.tapEnable(tap: tap, enable: true)
+            while !Thread.current.isCancelled {
+                CFRunLoopRunInMode(.defaultMode, 0.3, false)
+            }
+        }
+        t.name = "com.xiabill.VibeHub.eventtap"
+        t.qualityOfService = .userInteractive
+        tapThread = t
+        t.start()
         return true
     }
 
@@ -1142,7 +1154,9 @@ final class RemoteEngine: ObservableObject {
         stopLearning()
         pressedButtonIds.removeAll()
         if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
-        if let src = tapRunLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes) }
+        tapThread?.cancel()
+        tapThread = nil
+        if let src = tapRunLoopSource { CFRunLoopSourceInvalidate(src) }
         eventTap = nil
         tapRunLoopSource = nil
         if let m = manager {
