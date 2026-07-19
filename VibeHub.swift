@@ -874,6 +874,18 @@ final class RemoteConfig: ObservableObject {
             set: { self.mappings[buttonId] = $0 }
         )
     }
+
+    /// 自定义按键改名绑定（改动即随 customButtons.didSet 持久化）。
+    func customLabelBinding(_ id: String) -> Binding<String> {
+        Binding(
+            get: { self.customButtons.first { $0.id == id }?.label ?? "" },
+            set: { new in
+                if let i = self.customButtons.firstIndex(where: { $0.id == id }) {
+                    self.customButtons[i].label = new
+                }
+            }
+        )
+    }
 }
 
 // MARK: - Remote 模块：HID 监听 + CGEventTap 吞键
@@ -1217,6 +1229,15 @@ final class RemoteEngine: ObservableObject {
         // 登记吞键（与"执行 chord"解耦）：全吞模式下含未映射 / 未识别的键
         if !isNoise {
             captureSwallow(usagePage: usagePage, usage: usage, isDown: isDown, known: known)
+        }
+        // 面板打开时，未识别的新按键按下即自动收录，随后用户在列表里改名 + 配功能
+        if known == nil, isDown, !isNoise, panelVisible {
+            let hex = String(format: "0x%02X:0x%02X", usagePage, usage)
+            RemoteConfig.shared.addCustomButton(label: "新按键 \(hex)",
+                                                usagePage: usagePage, usage: usage)
+            lastHIDEvent = LastHIDEvent(usagePage: usagePage, usage: usage,
+                                        buttonLabel: "新按键 \(hex)")
+            return
         }
         guard let button = known else { return }
         dispatch(button: button, isDown: isDown)
@@ -1942,17 +1963,27 @@ struct RemoteTabView: View {
             lastKeyRow
             Divider()
             Text("自定义按键").font(.caption2).foregroundColor(.secondary)
+            Text("面板打开时按遥控器上未收录的键，会自动加到这里。改名并配好功能即可。")
+                .font(.caption2).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             ForEach(config.customButtons) { c in
-                HStack(spacing: 4) {
-                    KeyPickerRow(label: c.label, labelWidth: 68,
+                VStack(spacing: 2) {
+                    HStack(spacing: 4) {
+                        TextField("按键名称", text: config.customLabelBinding(c.id))
+                            .textFieldStyle(.roundedBorder).controlSize(.small)
+                        Text(String(format: "0x%02X:0x%02X", c.usagePage, c.usage))
+                            .font(.system(size: 9, design: .monospaced)).foregroundColor(.secondary)
+                        Button { config.removeCustomButton(c.id) } label: {
+                            Image(systemName: "trash")
+                        }
+                        .buttonStyle(.borderless).help("删除此自定义按键")
+                    }
+                    KeyPickerRow(label: "", labelWidth: 0,
                         mapping: config.binding(for: c.id), showModePicker: false,
                         rowId: "rm-\(c.id)", recordingRowId: $recordingRowId,
                         isPressed: engine.pressedButtonIds.contains(c.id))
-                    Button { config.removeCustomButton(c.id) } label: {
-                        Image(systemName: "trash")
-                    }
-                    .buttonStyle(.borderless).help("删除此自定义按键")
                 }
+                .padding(.vertical, 2)
             }
             learnControls
         }
