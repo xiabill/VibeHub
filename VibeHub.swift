@@ -1496,6 +1496,7 @@ struct KeyPickerRow: View {
     let rowId: String
     @Binding var recordingRowId: String?
     var isPressed: Bool = false   // Remote：该按键此刻被按下 → 行背景闪 accent
+    var labelBinding: Binding<String>? = nil   // 非 nil 时 label 位渲染可编辑名称框（自定义按键用）
 
     @StateObject private var recorder = KeyRecorder()
 
@@ -1504,7 +1505,13 @@ struct KeyPickerRow: View {
     var body: some View {
         HStack(spacing: 6) {
             Toggle("", isOn: $mapping.enabled).labelsHidden().controlSize(.small)
-            Text(label).frame(width: labelWidth, alignment: .leading).font(.system(size: 12))
+            if let lb = labelBinding {
+                TextField("名称", text: lb)
+                    .textFieldStyle(.roundedBorder).controlSize(.small)
+                    .frame(width: labelWidth)
+            } else {
+                Text(label).frame(width: labelWidth, alignment: .leading).font(.system(size: 12))
+            }
             Spacer(minLength: 4)
             if isRecording {
                 Text("按下快捷键…")
@@ -2002,13 +2009,11 @@ struct RemoteTabView: View {
                 .fixedSize(horizontal: false, vertical: true)
             ForEach(config.customButtons) { c in
                 HStack(spacing: 4) {
-                    TextField("名称", text: config.customLabelBinding(c.id))
-                        .textFieldStyle(.roundedBorder).controlSize(.small)
-                        .frame(width: 84)
-                    KeyPickerRow(label: "", labelWidth: 0,
+                    KeyPickerRow(label: "", labelWidth: 92,
                         mapping: config.binding(for: c.id), showModePicker: false,
                         rowId: "rm-\(c.id)", recordingRowId: $recordingRowId,
-                        isPressed: engine.pressedButtonIds.contains(c.id))
+                        isPressed: engine.pressedButtonIds.contains(c.id),
+                        labelBinding: config.customLabelBinding(c.id))
                     Button { config.removeCustomButton(c.id) } label: {
                         Image(systemName: "trash")
                     }
