@@ -2455,10 +2455,26 @@ struct RemoteTabView: View {
 
 // MARK: - UI: 主面板（segmented picker + ZStack，Tab 切换不重建视图树）
 
+/// 上报 Tab 内容实际高度，驱动「不超上限自适应、超上限内部滚动」。
+private struct TabsHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var loginItem = LaunchAtLogin.shared
     @State private var selectedTab: String = "airpods"
     @State private var recordingRowId: String? = nil   // 全局唯一录制行；切 Tab 时清空
+    @State private var tabsHeight: CGFloat = 400
+
+    /// 内容区高度上限。popover 高度无界时，高且动态的内容（自定义键行、条件卡片）
+    /// 会让 NSPopover 的 AutoLayout 求解递归爆栈（两次崩溃同栈：NSISEngine
+    /// _flushPendingRemovals 栈溢出）。不超上限保持自适应不滚动，超过转内部滚动。
+    private var maxTabsHeight: CGFloat {
+        ((NSScreen.main?.visibleFrame.height) ?? 900) - 160
+    }
 
     private var appVersion: String {
         (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "dev"
@@ -2479,15 +2495,23 @@ struct ContentView: View {
 
             Divider()
 
-            ZStack(alignment: .top) {
-                AirPodsTabView(recordingRowId: $recordingRowId)
-                    .opacity(selectedTab == "airpods" ? 1 : 0)
-                    .allowsHitTesting(selectedTab == "airpods")
-                RemoteTabView(recordingRowId: $recordingRowId)
-                    .opacity(selectedTab == "remote" ? 1 : 0)
-                    .allowsHitTesting(selectedTab == "remote")
+            ScrollView(.vertical, showsIndicators: false) {
+                ZStack(alignment: .top) {
+                    AirPodsTabView(recordingRowId: $recordingRowId)
+                        .opacity(selectedTab == "airpods" ? 1 : 0)
+                        .allowsHitTesting(selectedTab == "airpods")
+                    RemoteTabView(recordingRowId: $recordingRowId)
+                        .opacity(selectedTab == "remote" ? 1 : 0)
+                        .allowsHitTesting(selectedTab == "remote")
+                }
+                .frame(width: 360)
+                .background(GeometryReader { g in
+                    Color.clear.preference(key: TabsHeightKey.self, value: g.size.height)
+                })
             }
             .frame(width: 360)
+            .frame(height: min(max(tabsHeight, 200), maxTabsHeight))
+            .onPreferenceChange(TabsHeightKey.self) { tabsHeight = $0 }
 
             Divider()
 
