@@ -782,6 +782,9 @@ final class RemoteConfig: ObservableObject {
 
     @Published var mappings: [String: Mapping] { didSet { saveMappings() } }
     @Published var customButtons: [CustomRemoteButton] { didSet { saveCustom() } }
+    /// 本次会话内自动收录、尚未配置的按键 id（不持久化）：列表里标「新发现」，
+    /// 用户改名或绑定后移除标记。
+    @Published var newButtonIds: Set<String> = []
     @Published var moduleEnabled: Bool {
         didSet { UserDefaults.standard.set(moduleEnabled, forKey: enabledKey) }
     }
@@ -872,12 +875,14 @@ final class RemoteConfig: ObservableObject {
         customButtons.append(CustomRemoteButton(id: id, label: label,
                                                 usagePage: usagePage, usage: usage))
         mappings[id] = Mapping()
+        newButtonIds.insert(id)
     }
 
     /// 删除自学习按键：清掉按键、映射，并停掉可能残留的 auto-repeat。
     func removeCustomButton(_ id: String) {
         customButtons.removeAll { $0.id == id }
         mappings.removeValue(forKey: id)
+        newButtonIds.remove(id)
         RemoteEngine.shared.stopAutoRepeat(buttonId: id)
     }
 
@@ -887,6 +892,7 @@ final class RemoteConfig: ObservableObject {
         for id in ids { RemoteEngine.shared.stopAutoRepeat(buttonId: id) }
         customButtons.removeAll()
         for id in ids { mappings.removeValue(forKey: id) }
+        newButtonIds.removeAll()
     }
 
     func resetToDefaults() {
@@ -923,7 +929,10 @@ final class RemoteConfig: ObservableObject {
     func binding(for buttonId: String) -> Binding<Mapping> {
         Binding(
             get: { self.mappings[buttonId] ?? Mapping() },
-            set: { self.mappings[buttonId] = $0 }
+            set: {
+                self.mappings[buttonId] = $0
+                if !$0.keys.isEmpty { self.newButtonIds.remove(buttonId) }  // 绑定即视为已配置
+            }
         )
     }
 
@@ -934,6 +943,7 @@ final class RemoteConfig: ObservableObject {
             set: { new in
                 if let i = self.customButtons.firstIndex(where: { $0.id == id }) {
                     self.customButtons[i].label = new
+                    self.newButtonIds.remove(id)   // 改名即视为已配置
                 }
             }
         )
@@ -957,9 +967,7 @@ final class RemoteEngine: ObservableObject {
     private var learnTimer: Timer?
 
     // —— 按下反馈 / 最近按键回显（HID 回调在引擎线程，更新一律 hop 主线程）——
-    struct LastHIDEvent { let usagePage: UInt32; let usage: UInt32; let buttonLabel: String? }
     @Published var pressedButtonIds: Set<String> = []   // 仅对已知按键维护，抬起移除
-    @Published var lastHIDEvent: LastHIDEvent?
 
     /// 面板打开期间为 true：仍吞原生事件、仍更新回显，但不执行绑定 chord / auto-repeat。
     /// 主线程写（AppDelegate 管理生命周期）、引擎线程读，走 stateLock。
@@ -1359,14 +1367,7 @@ final class RemoteEngine: ObservableObject {
         let debounceOK = now - lastAnyDownAt > 0.3
         if isDown && !isNoise { lastAnyDownAt = now }
 
-        // 回显与按下高亮：无论是否在列表 / 是否学习态都更新 lastHIDEvent。
-        if isDown && !isNoise {
-            let label = known?.label
-            DispatchQueue.main.async { [weak self] in
-                self?.lastHIDEvent = LastHIDEvent(usagePage: usagePage, usage: usage,
-                                                  buttonLabel: label)
-            }
-        }
+        // 按下高亮：仅对已知按键维护
         if let button = known {
             let id = button.id
             DispatchQueue.main.async { [weak self] in
@@ -1404,11 +1405,9 @@ final class RemoteEngine: ObservableObject {
         if known == nil, isDown, debounceOK, panelVisible,
            isRealButtonUsage(usagePage: usagePage, usage: usage) {
             let hex = String(format: "0x%02X:0x%02X", usagePage, usage)
-            DispatchQueue.main.async { [weak self] in
+            DispatchQueue.main.async {
                 RemoteConfig.shared.addCustomButton(label: "新按键 \(hex)",
                                                     usagePage: usagePage, usage: usage)
-                self?.lastHIDEvent = LastHIDEvent(usagePage: usagePage, usage: usage,
-                                                  buttonLabel: "新按键 \(hex)")
             }
             return
         }
@@ -1485,9 +1484,16 @@ final class AudioInputMonitor: ObservableObject {
     @Published private(set) var isTesting = false
     @Published private(set) var level: Float = 0      // 0...1 归一化电平
     @Published private(set) var testError: String?
+    @Published private(set) var hasRecording = false  // 上次录音可回放
+    @Published private(set) var isPlaying = false
 
     private var engine: AVAudioEngine?
     private var timeoutItem: DispatchWorkItem?
+    private var recFile: AVAudioFile?                 // 录音测试同时落盘，供回放判断音质
+    private var player: AVAudioPlayer?
+    private var playGen = 0
+    private let recURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("vibehub-mic-test.caf")
     private var defaultInputAddr = AudioObjectPropertyAddress(
         mSelector: kAudioHardwarePropertyDefaultInputDevice,
         mScope: kAudioObjectPropertyScopeGlobal,
@@ -1547,7 +1553,9 @@ final class AudioInputMonitor: ObservableObject {
         guard fmt.sampleRate > 0, fmt.channelCount > 0 else {
             testError = "无法读取输入设备格式（设备可能未就绪或被占用）"; return
         }
+        recFile = try? AVAudioFile(forWriting: recURL, settings: fmt.settings)
         input.installTap(onBus: 0, bufferSize: 1024, format: fmt) { [weak self] buffer, _ in
+            try? self?.recFile?.write(from: buffer)
             guard let ch = buffer.floatChannelData?[0] else { return }
             let n = Int(buffer.frameLength)
             if n == 0 { return }
@@ -1578,8 +1586,36 @@ final class AudioInputMonitor: ObservableObject {
             eng.stop()
         }
         engine = nil
+        if recFile != nil {
+            recFile = nil                      // 关闭文件（AVAudioFile 无显式 close，置 nil 落盘）
+            hasRecording = true
+        }
         isTesting = false
         level = 0
+    }
+
+    // —— 回放（判断录音音质）——
+
+    func play() {
+        guard !isTesting, hasRecording, !isPlaying,
+              let p = try? AVAudioPlayer(contentsOf: recURL) else { return }
+        player = p
+        p.play()
+        isPlaying = true
+        playGen += 1
+        let gen = playGen
+        // ponytail: asyncAfter 估时收尾而非 delegate，误差 ±0.2s 无感；要精确改 AVAudioPlayerDelegate
+        DispatchQueue.main.asyncAfter(deadline: .now() + p.duration + 0.2) { [weak self] in
+            guard let self, self.playGen == gen else { return }
+            self.stopPlayback()
+        }
+    }
+
+    func stopPlayback() {
+        playGen += 1
+        player?.stop()
+        player = nil
+        isPlaying = false
     }
 }
 
@@ -1679,7 +1715,7 @@ struct KeyPickerRow: View {
                     .textFieldStyle(.roundedBorder).controlSize(.small)
                     .frame(width: labelWidth)
                     .focused($nameFocused)
-                    .onSubmit { commitName() }
+                    .onSubmit { commitName(); nameFocused = false }   // 回车确认后收焦点，高亮框消失
                     .onChange(of: nameFocused) { focused in if !focused { commitName() } }
                     .onAppear { editName = labelBinding?.wrappedValue ?? "" }
             } else {
@@ -2173,7 +2209,6 @@ struct RemoteTabView: View {
                     .font(.caption2).foregroundColor(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            lastKeyRow
             Divider()
             HStack(spacing: 4) {
                 Text("自定义按键").font(.caption2).foregroundColor(.secondary)
@@ -2184,7 +2219,7 @@ struct RemoteTabView: View {
                     }.buttonStyle(.borderless).font(.caption)
                 }
             }
-            Text("面板打开时按遥控器上未收录的键，会自动加到这里。改名并配好功能即可。")
+            Text("面板打开时按键不执行绑定（配置模式）；按遥控器上未收录的键会自动加到这里并标「新发现」，改名、绑定即可。")
                 .font(.caption2).foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             ForEach(config.customButtons) { c in
@@ -2194,6 +2229,13 @@ struct RemoteTabView: View {
                         rowId: "rm-\(c.id)", recordingRowId: $recordingRowId,
                         isPressed: engine.pressedButtonIds.contains(c.id),
                         labelBinding: config.customLabelBinding(c.id))
+                    if config.newButtonIds.contains(c.id) {
+                        Text("新发现").font(.caption2)
+                            .padding(.horizontal, 4).padding(.vertical, 1)
+                            .background(Color.orange.opacity(0.18))
+                            .foregroundColor(.orange).cornerRadius(3)
+                            .help("刚自动收录的按键：改个名字并绑定功能")
+                    }
                     Button { config.removeCustomButton(c.id) } label: {
                         Image(systemName: "trash")
                     }
@@ -2208,31 +2250,6 @@ struct RemoteTabView: View {
                 config.clearAllCustomButtons()
             }
             Button("取消", role: .cancel) {}
-        }
-    }
-
-    /// 最近按键回显 + 常驻提示：已知给 label+usage，未知给橙色发现提示，无事件给灰字。
-    @ViewBuilder private var lastKeyRow: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(alignment: .top, spacing: 4) {
-                Text("最近按键").font(.caption2).foregroundColor(.secondary)
-                if let e = engine.lastHIDEvent {
-                    if let lbl = e.buttonLabel {
-                        Text(String(format: "%@ (0x%02X:0x%02X)", lbl, e.usagePage, e.usage))
-                            .font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
-                    } else {
-                        Text(String(format: "未知按键 0x%02X:0x%02X — 可通过下方「学习新按键」添加",
-                                    e.usagePage, e.usage))
-                            .font(.caption2).foregroundColor(.orange)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                } else {
-                    Text("按一下遥控器试试").font(.caption2).foregroundColor(.secondary)
-                }
-                Spacer(minLength: 0)
-            }
-            Text("面板打开时按键不执行绑定（配置模式）")
-                .font(.caption2).foregroundColor(.secondary)
         }
     }
 
@@ -2384,12 +2401,20 @@ struct RemoteTabView: View {
                 if audio.isTesting {
                     Button("停止") { audio.stopTest() }
                         .buttonStyle(.borderless).font(.caption)
+                } else if audio.isPlaying {
+                    Button("停止回放") { audio.stopPlayback() }
+                        .buttonStyle(.borderless).font(.caption)
                 } else {
+                    if audio.hasRecording {
+                        Button { audio.play() } label: {
+                            Label("回放", systemImage: "play.circle")
+                        }.buttonStyle(.borderless).font(.caption)
+                    }
                     Button {
                         scanDevicesAsync()   // 刷新 HID 名，供是否遥控器匹配
                         audio.startTest()
                     } label: {
-                        Label("测试麦克风", systemImage: "mic")
+                        Label("录音测试", systemImage: "record.circle")
                     }.buttonStyle(.borderless).font(.caption)
                 }
             }
@@ -2424,7 +2449,7 @@ struct RemoteTabView: View {
                         }
                     }
                     .frame(height: 8)
-                    Text("对着遥控器说话，绿条应随声音跳动（15 秒后自动停）")
+                    Text("对着遥控器说话，绿条应随声音跳动（15 秒后自动停，停止后可回放听音质）")
                         .font(.caption2).foregroundColor(.secondary)
                 }
             }
@@ -2711,7 +2736,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // transient 自动关 / performClose 都会回调这里：面板不可见后恢复按键执行绑定。
     func popoverDidClose(_ notification: Notification) {
         RemoteEngine.shared.panelVisible = false
-        AudioInputMonitor.shared.stopTest()   // 面板关了没人看电平，别让麦克风橙点继续亮
+        AudioInputMonitor.shared.stopTest()       // 面板关了没人看电平，别让麦克风橙点继续亮
+        AudioInputMonitor.shared.stopPlayback()
     }
 
     private func showContextMenu(from button: NSStatusBarButton, event: NSEvent) {
