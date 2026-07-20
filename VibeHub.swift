@@ -1478,6 +1478,7 @@ struct InputDevice: Identifiable, Hashable {
     let id: AudioDeviceID
     let name: String
     let uid: String
+    let manufacturer: String   // 遥控器接收器音频侧名叫 "Mic Device"，厂商却是 "XING WEI 2.4G USB"——名字认不出，靠厂商字段兜底
 }
 
 /// 只读展示"系统默认输入设备"名称/UID（纯 CoreAudio 属性，不开麦、不需权限），
@@ -1559,7 +1560,8 @@ final class AudioInputMonitor: ObservableObject {
         for id in ids where inputChannelCount(id) > 0 {
             let name = deviceString(id, kAudioObjectPropertyName) ?? "未知设备"
             let uid  = deviceString(id, kAudioDevicePropertyDeviceUID) ?? ""
-            result.append(InputDevice(id: id, name: name, uid: uid))
+            let manufacturer = deviceString(id, kAudioObjectPropertyManufacturer) ?? ""
+            result.append(InputDevice(id: id, name: name, uid: uid, manufacturer: manufacturer))
         }
         inputDevices = result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         // 选中的设备若已拔掉，退回跟随系统默认
@@ -2515,7 +2517,7 @@ struct RemoteTabView: View {
                                 .background(Color.secondary.opacity(0.18))
                                 .foregroundColor(.secondary).cornerRadius(3)
                         }
-                        if looksLikeRemote(name: dev.name, uid: dev.uid) {
+                        if looksLikeRemote(dev) {
                             Text("遥控器").font(.caption2)
                                 .padding(.horizontal, 5).padding(.vertical, 1)
                                 .background(Color.green.opacity(0.18))
@@ -2530,6 +2532,13 @@ struct RemoteTabView: View {
             Text("点选要测试的麦克风；不选则跟随系统默认。")
                 .font(.caption2).foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            // 系统默认输入是遥控器自带 mic 时警告：接收器传音频流会饿死按键通道，录音期间遥控器按键全无响应
+            if let def = audio.inputDevices.first(where: { $0.id == audio.defaultDeviceID }),
+               looksLikeRemote(def) {
+                Text("⚠️ 系统默认输入是遥控器自带 mic：录音期间接收器忙于传音频，遥控器按键会无响应（且 16kHz 音质差）。语音输入工具（Typeless 等）请改用其它麦克风，遥控器只当按键用。")
+                    .font(.caption2).foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             // 电平表（仅测试期间）
             if audio.isTesting {
                 VStack(alignment: .leading, spacing: 3) {
@@ -2565,21 +2574,26 @@ struct RemoteTabView: View {
     /// best-effort 判断"某输入设备是不是当前目标遥控器"。
     /// 先看设备 UID 里是否同时含目标 VID+PID 的 hex（强信号），再退到设备名/厂商名模糊匹配。
     // ponytail: 名称启发式，跨设备命名不一致可能漏判；漏判时只是不显示徽标，不会误接管。
-    private func looksLikeRemote(name: String, uid: String) -> Bool {
-        let uid = uid.lowercased()
+    private func looksLikeRemote(_ dev: InputDevice) -> Bool {
+        let uid = dev.uid.lowercased()
         if !uid.isEmpty {
             let vidHex = String(format: "%04x", config.targetVID)
             let pidHex = String(format: "%04x", config.targetPID)
             if uid.contains(vidHex) && uid.contains(pidHex) { return true }
         }
-        let inNorm = normalizeName(name)
-        guard !inNorm.isEmpty else { return false }
         let target = detectedDevices.first {
             $0.vendorId == config.targetVID && $0.productId == config.targetPID
         }
-        for cand in [target?.product, target?.manufacturer].compactMap({ $0 }) {
-            let c = normalizeName(cand)
-            if c.count >= 3 && (inNorm.contains(c) || c.contains(inNorm)) { return true }
+        // 设备侧的名字和厂商字段任一，与 HID 侧的 product/manufacturer 任一互 contains 即判定。
+        // 因为音频侧和 HID 侧对同一接收器的命名各写各的（音频名 "Mic Device"、厂商 "XING WEI 2.4G USB"），
+        // 只有把两侧的两个字段两两对撞才认得出。
+        for devCand in [dev.name, dev.manufacturer] {
+            let inNorm = normalizeName(devCand)
+            guard !inNorm.isEmpty else { continue }
+            for cand in [target?.product, target?.manufacturer].compactMap({ $0 }) {
+                let c = normalizeName(cand)
+                if c.count >= 3 && (inNorm.contains(c) || c.contains(inNorm)) { return true }
+            }
         }
         return false
     }
