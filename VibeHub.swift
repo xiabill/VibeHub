@@ -1089,7 +1089,9 @@ final class RemoteEngine: ObservableObject {
         let pt = known?.passthrough ?? inferPassthrough(usagePage: usagePage, usage: usage)
         if let sk = swallowKey(forPassthrough: pt) {
             applySwallow(sk, isDown: isDown)
-        } else {
+        } else if isRealButtonUsage(usagePage: usagePage, usage: usage) {
+            // 只有"像真实按键"的 usage 参与按住贪吞；垃圾影子 usage（如 0x07:0xFFFFFFFF）
+            // 可能只发 down 不发 up，进 greedyHeld 会永久吞掉整台键盘。
             setGreedyHold(usageKey: UInt64(usagePage) << 32 | UInt64(usage), down: isDown)
         }
         armGreedy(ms: 40)
@@ -1421,11 +1423,21 @@ final class RemoteEngine: ObservableObject {
             // 面板打开时：swallow 已处理（吞掉 OK→Enter 等原生事件），但不执行绑定，
             // 否则切窗/Enter 会抢焦点、把 transient popover 自动关掉、打断输名字。
             if panelVisible { return }
-            postChordDownAsync(keyIds: mapping.keys)
-            postChordUpAsync(keyIds: mapping.keys)
-            let id = button.id, keys = mapping.keys
-            DispatchQueue.main.async { [weak self] in self?.startAutoRepeat(buttonId: id, keys: keys) }
+            if mapping.mode == .holdToggle {
+                // 按住模式：chord 跟随物理按键——按下压住、抬起才松开
+                // （Typeless 按住说话这类场景；不参与 auto-repeat）
+                postChordDownAsync(keyIds: mapping.keys)
+            } else {
+                postChordDownAsync(keyIds: mapping.keys)
+                postChordUpAsync(keyIds: mapping.keys)
+                let id = button.id, keys = mapping.keys
+                DispatchQueue.main.async { [weak self] in self?.startAutoRepeat(buttonId: id, keys: keys) }
+            }
         } else {
+            if mapping.mode == .holdToggle {
+                // 面板开着按下被跳过时，这里会补发一个多余的 chord up——无害（up 幂等）
+                postChordUpAsync(keyIds: mapping.keys)
+            }
             let id = button.id
             // 抬起始终停 repeat（含面板打开前已启动的）；down/up 依次入主队列，顺序有保证
             DispatchQueue.main.async { [weak self] in self?.stopAutoRepeat(buttonId: id) }
@@ -1641,7 +1653,7 @@ struct KeyPickerRow: View {
     let label: String
     let labelWidth: CGFloat
     @Binding var mapping: Mapping
-    let showModePicker: Bool  // AirPods=true（点按/按住），Remote=false
+    let showModePicker: Bool  // 点按/按住 模式菜单（AirPods=切换语义，Remote=跟随物理按住）
     let rowId: String
     @Binding var recordingRowId: String?
     var isPressed: Bool = false   // Remote：该按键此刻被按下 → 行背景闪 accent
@@ -2135,7 +2147,7 @@ struct RemoteTabView: View {
         Group {
             if let b = remoteButtons.first(where: { $0.id == id }) {
                 KeyPickerRow(label: b.label, labelWidth: 68,
-                    mapping: config.binding(for: id), showModePicker: false,
+                    mapping: config.binding(for: id), showModePicker: true,
                     rowId: "rm-\(id)", recordingRowId: $recordingRowId,
                     isPressed: engine.pressedButtonIds.contains(id))
             }
@@ -2178,7 +2190,7 @@ struct RemoteTabView: View {
             ForEach(config.customButtons) { c in
                 HStack(spacing: 4) {
                     KeyPickerRow(label: "", labelWidth: 92,
-                        mapping: config.binding(for: c.id), showModePicker: false,
+                        mapping: config.binding(for: c.id), showModePicker: true,
                         rowId: "rm-\(c.id)", recordingRowId: $recordingRowId,
                         isPressed: engine.pressedButtonIds.contains(c.id),
                         labelBinding: config.customLabelBinding(c.id))
