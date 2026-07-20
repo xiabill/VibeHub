@@ -708,12 +708,18 @@ func isRealButtonUsage(usagePage: UInt32, usage: UInt32) -> Bool {
 }
 
 /// 先查硬编码 12 颗按键，未命中再查用户自定义按键。
-func remoteButton(usagePage: UInt32, usage: UInt32) -> RemoteButton? {
+/// custom 显式传入：引擎线程用 EngineSnapshot 的拷贝，不跨线程读 RemoteConfig。
+func remoteButton(usagePage: UInt32, usage: UInt32, custom: [CustomRemoteButton]) -> RemoteButton? {
     if let b = buttonByUsage[UInt64(usagePage) << 32 | UInt64(usage)] { return b }
-    if let c = RemoteConfig.shared.customButtons.first(where: {
+    if let c = custom.first(where: {
         $0.usagePage == usagePage && $0.usage == usage
     }) { return customToRemoteButton(c) }
     return nil
+}
+
+/// 主线程便捷版（直接读 shared config）。
+func remoteButton(usagePage: UInt32, usage: UInt32) -> RemoteButton? {
+    remoteButton(usagePage: usagePage, usage: usage, custom: RemoteConfig.shared.customButtons)
 }
 
 /// 默认目标设备：XING WEI 2.4G USB（常见国产 2.4G TV 遥控器接收器）
@@ -790,7 +796,10 @@ final class RemoteConfig: ObservableObject {
     }
     /// 全吞模式：开启后遥控器任意键（含未映射 / 未识别）的系统原生行为都被吞掉。
     @Published var captureAllKeys: Bool {
-        didSet { UserDefaults.standard.set(captureAllKeys, forKey: captureAllKey) }
+        didSet {
+            UserDefaults.standard.set(captureAllKeys, forKey: captureAllKey)
+            updateEngineSnapshot()
+        }
     }
     @Published var targetVID: Int { didSet { UserDefaults.standard.set(targetVID, forKey: vidKey) } }
     @Published var targetPID: Int { didSet { UserDefaults.standard.set(targetPID, forKey: pidKey) } }
@@ -817,18 +826,42 @@ final class RemoteConfig: ObservableObject {
         self.captureAllKeys           = (d.object(forKey: captureAllKey) as? Bool) ?? true
         self.targetVID                = (d.object(forKey: vidKey) as? Int) ?? DEFAULT_TARGET_VID
         self.targetPID                = (d.object(forKey: pidKey) as? Int) ?? DEFAULT_TARGET_PID
+        updateEngineSnapshot()   // init 内赋值不触发 didSet，手动建立首份快照
     }
 
     private func saveMappings() {
         if let data = try? JSONEncoder().encode(mappings) {
             UserDefaults.standard.set(data, forKey: storeKey)
         }
+        updateEngineSnapshot()
     }
 
     private func saveCustom() {
         if let data = try? JSONEncoder().encode(customButtons) {
             UserDefaults.standard.set(data, forKey: customKey)
         }
+        updateEngineSnapshot()
+    }
+
+    // —— 引擎线程只读快照 ——
+    // mappings/customButtons/captureAllKeys 在主线程写入，HID/tap 后台线程读取
+    // 必须走快照拷贝，跨线程直接读 Swift 容器是数据竞争（可崩）。
+    struct EngineSnapshot {
+        let mappings: [String: Mapping]
+        let customButtons: [CustomRemoteButton]
+        let captureAllKeys: Bool
+    }
+    private let snapLock = NSLock()
+    private var snap = EngineSnapshot(mappings: [:], customButtons: [], captureAllKeys: true)
+    var engineSnapshot: EngineSnapshot {
+        snapLock.lock(); defer { snapLock.unlock() }
+        return snap
+    }
+    private func updateEngineSnapshot() {
+        snapLock.lock()
+        snap = EngineSnapshot(mappings: mappings, customButtons: customButtons,
+                              captureAllKeys: captureAllKeys)
+        snapLock.unlock()
     }
 
     /// 添加自学习按键：追加到 customButtons 并建一条默认映射。
@@ -923,52 +956,90 @@ final class RemoteEngine: ObservableObject {
     @Published var learnDuplicate: String?   // 学习时命中已存在按键 → 该按键 label（提示重复）
     private var learnTimer: Timer?
 
-    // —— 按下反馈 / 最近按键回显（HID 回调在主 runloop，@Published 更新安全）——
+    // —— 按下反馈 / 最近按键回显（HID 回调在引擎线程，更新一律 hop 主线程）——
     struct LastHIDEvent { let usagePage: UInt32; let usage: UInt32; let buttonLabel: String? }
     @Published var pressedButtonIds: Set<String> = []   // 仅对已知按键维护，抬起移除
     @Published var lastHIDEvent: LastHIDEvent?
 
     /// 面板打开期间为 true：仍吞原生事件、仍更新回显，但不执行绑定 chord / auto-repeat。
-    /// 非 @Published，只在主线程读写（AppDelegate 管理生命周期）。
-    var panelVisible = false
+    /// 主线程写（AppDelegate 管理生命周期）、引擎线程读，走 stateLock。
+    var panelVisible: Bool {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _panelVisible }
+        set { stateLock.lock(); _panelVisible = newValue; stateLock.unlock() }
+    }
+    private var _panelVisible = false
+    /// isLearning 的引擎侧镜像：@Published 本体只在主线程读写供 UI 绑定，引擎线程读镜像。
+    private var learnArmed: Bool {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _learnArmed }
+        set { stateLock.lock(); _learnArmed = newValue; stateLock.unlock() }
+    }
+    private var _learnArmed = false
+    /// 保护 _panelVisible/_learnArmed/eventTap/engineRunLoop/openedDevices 的跨线程访问。
+    private let stateLock = NSLock()
 
     private var manager: IOHIDManager?
-    private var openedDevices: Set<IOHIDDevice> = []
-    private var eventTap: CFMachPort?
+    private var openedDevices: Set<IOHIDDevice> = []   // 读写走 stateLock（设备回调在引擎线程，stop 在主线程）
+    private var eventTap: CFMachPort?                  // 读写走 stateLock（tap 回调在引擎线程，stop 在主线程）
     private var tapRunLoopSource: CFRunLoopSource?
-    private var tapThread: Thread?   // CGEventTap 跑在专用后台线程，避免与主线程 SwiftUI 布局争抢
-    private var repeatTimers: [String: Timer] = [:]
+    private var engineThread: Thread?                  // HID 回调 + CGEventTap 同跑这条专用线程（见 start()）
+    private var engineRunLoop: CFRunLoop?              // 读写走 stateLock
+    private var repeatTimers: [String: Timer] = [:]    // 仅主线程访问（start/stopAutoRepeat 均 hop 到主线程）
 
     enum SwallowKey: Hashable {
         case keyboard(Int64)
         case consumer(Int32)
     }
-    private var swallowSet: Set<SwallowKey> = []
+    // 引用计数而非集合：同键 100ms 内二次按下时，上一次抬起的延迟摘除只抵掉
+    // 自己那一份登记，不会误摘新按下的登记。
+    private var swallowCounts: [SwallowKey: Int] = [:]
     private let swallowLock = NSLock()
 
-    private func addSwallow(_ k: SwallowKey)    { swallowLock.lock(); swallowSet.insert(k); swallowLock.unlock() }
-    private func removeSwallow(_ k: SwallowKey) { swallowLock.lock(); swallowSet.remove(k); swallowLock.unlock() }
+    private func addSwallow(_ k: SwallowKey) {
+        swallowLock.lock(); swallowCounts[k, default: 0] += 1; swallowLock.unlock()
+    }
+    private func removeSwallow(_ k: SwallowKey) {
+        swallowLock.lock()
+        if let c = swallowCounts[k] {
+            if c <= 1 { swallowCounts.removeValue(forKey: k) } else { swallowCounts[k] = c - 1 }
+        }
+        swallowLock.unlock()
+    }
     private func shouldSwallow(_ k: SwallowKey) -> Bool {
         swallowLock.lock(); defer { swallowLock.unlock() }
-        return swallowSet.contains(k)
+        return swallowCounts[k] != nil
     }
     private func clearSwallows() {
-        swallowLock.lock(); swallowSet.removeAll(); swallowLock.unlock()
-        greedyLock.lock(); greedyUntil = 0; greedyLock.unlock()
+        swallowLock.lock(); swallowCounts.removeAll(); swallowLock.unlock()
+        greedyLock.lock(); greedyUntil = 0; greedyHeld.removeAll(); greedyLock.unlock()
     }
 
     // 全吞兜底：遥控器一有按键动作就开一个极短窗，窗口内吞掉一切非自家事件，
-    // 覆盖认不出 keycode 的冷门键。窗口过期自动失效（无需清理线程）。
+    // 覆盖认不出 keycode 的冷门键；这类键按住期间保持贪吞（greedyHeld），
+    // 否则长按时系统合成的 auto-repeat 会在短窗过期后漏出。
     private var greedyUntil: CFAbsoluteTime = 0
+    private var greedyHeld: Set<UInt64> = []   // 按住中的"无精确 keycode"键（usageKey）
     private let greedyLock = NSLock()
-    // 自动收录去抖：一次物理按键的复合上报只收第一个（HID 回调在主 runloop，无需锁）
-    private var lastAutoCaptureAt: CFAbsoluteTime = 0
+    // 自动收录去抖（仅引擎线程访问）：任何非噪声按下都更新，影子 usage 与真键
+    // 同一次按下、几乎同时上报，永远落进 0.3s 内被挡住（含真键已识别的后续按下）。
+    private var lastAnyDownAt: CFAbsoluteTime = 0
     private func armGreedy(ms: Double) {
-        greedyLock.lock(); greedyUntil = CFAbsoluteTimeGetCurrent() + ms / 1000.0; greedyLock.unlock()
+        greedyLock.lock()
+        greedyUntil = max(greedyUntil, CFAbsoluteTimeGetCurrent() + ms / 1000.0)
+        greedyLock.unlock()
+    }
+    private func setGreedyHold(usageKey: UInt64, down: Bool) {
+        greedyLock.lock()
+        if down {
+            greedyHeld.insert(usageKey)
+        } else {
+            greedyHeld.remove(usageKey)
+            greedyUntil = max(greedyUntil, CFAbsoluteTimeGetCurrent() + 0.1)  // 收口抬起残留
+        }
+        greedyLock.unlock()
     }
     private func inGreedyWindow() -> Bool {
         greedyLock.lock(); defer { greedyLock.unlock() }
-        return CFAbsoluteTimeGetCurrent() < greedyUntil
+        return !greedyHeld.isEmpty || CFAbsoluteTimeGetCurrent() < greedyUntil
     }
 
     private func swallowKey(for button: RemoteButton) -> SwallowKey? {
@@ -985,33 +1056,41 @@ final class RemoteEngine: ObservableObject {
 
     /// keydown 时登记吞键，keyup 时 100ms 延迟摘除（吞掉系统"按起"与 auto-repeat 残留）。
     private func applySwallow(_ sk: SwallowKey, isDown: Bool) {
-        if isDown {
-            addSwallow(sk)
-        } else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                self?.removeSwallow(sk)
-            }
+        if isDown { addSwallow(sk) } else { removeSwallowLater(sk) }
+    }
+
+    private func removeSwallowLater(_ sk: SwallowKey) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.removeSwallow(sk)
         }
     }
 
-    /// 登记吞键（与"执行 chord"解耦）。
-    /// - 全吞开启：任意非噪声键都吞——能算出 keycode/consumer 的走精确 swallowSet（低误伤），
-    ///   同时开短窗贪吞兜底认不出的键。
-    /// - 全吞关闭：退回旧行为，仅对"已启用且已绑定"的已知键吞。
-    private func captureSwallow(usagePage: UInt32, usage: UInt32, isDown: Bool, known: RemoteButton?) {
-        let cfg = RemoteConfig.shared
+    /// 登记吞键（与"执行 chord"解耦）。在引擎线程同步执行——与 tap 同线程串行，
+    /// 保证"先登记、后消费"，不受主线程忙碌影响。
+    /// - 全吞开启：能算出 keycode/consumer 的键走精确计数（低误伤）；推不出的键
+    ///   按住期间保持贪吞（greedyHeld，防长按 auto-repeat 漏出）；40ms 短窗盖伴生影子事件。
+    /// - 全吞关闭：退回旧行为，仅吞"已启用且已绑定"的已知键；键在按住期间被删除时
+    ///   抬起仍无条件补一次摘除（引用计数下多摘是 no-op），防 swallow 残留永久吞真键盘。
+    private func captureSwallow(usagePage: UInt32, usage: UInt32, isDown: Bool,
+                                known: RemoteButton?, cfg: RemoteConfig.EngineSnapshot) {
         guard cfg.captureAllKeys else {
             if let b = known {
                 let m = cfg.mappings[b.id] ?? Mapping()
                 if m.enabled, !m.keys.isEmpty, let sk = swallowKey(for: b) {
                     applySwallow(sk, isDown: isDown)
                 }
+            } else if !isDown,
+                      let sk = swallowKey(forPassthrough: inferPassthrough(usagePage: usagePage,
+                                                                           usage: usage)) {
+                removeSwallowLater(sk)
             }
             return
         }
         let pt = known?.passthrough ?? inferPassthrough(usagePage: usagePage, usage: usage)
         if let sk = swallowKey(forPassthrough: pt) {
             applySwallow(sk, isDown: isDown)
+        } else {
+            setGreedyHold(usageKey: UInt64(usagePage) << 32 | UInt64(usage), down: isDown)
         }
         armGreedy(ms: 40)
     }
@@ -1060,8 +1139,6 @@ final class RemoteEngine: ObservableObject {
             let me = Unmanaged<RemoteEngine>.fromOpaque(ctx).takeUnretainedValue()
             me.onDeviceRemoved(device)
         }, selfPtr)
-        IOHIDManagerScheduleWithRunLoop(m, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-
         // 不 seize（self-signed app 拿不到 driverkit entitlement）。普通 open + CGEventTap 吞咽。
         let r = IOHIDManagerOpen(m, IOOptionBits(kIOHIDOptionsTypeNone))
         if r != kIOReturnSuccess {
@@ -1070,10 +1147,34 @@ final class RemoteEngine: ObservableObject {
                 self?.lastError = "IOHIDManagerOpen 返回 \(hex)。请确认遥控器已插入、并且「输入监听」权限给到了 VibeHub。"
             }
             NSLog("RemoteEngine: IOHIDManagerOpen failed: \(hex)")
-            IOHIDManagerUnscheduleFromRunLoop(m, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
             return false
         }
-        if !installEventTap() {
+
+        // HID 回调与 CGEventTap 同跑一条专用后台线程：
+        // ① 都不受主线程 SwiftUI 布局阻塞（按键零延迟）；
+        // ② 单线程串行保证"HID 回调先登记吞键、tap 后消费系统事件"的顺序，
+        //    主线程再忙也不会漏吞（登记与消费不再跨线程竞速）。
+        let sem = DispatchSemaphore(value: 0)
+        var tapInstalled = false
+        let t = Thread { [weak self] in
+            guard let self else { sem.signal(); return }
+            IOHIDManagerScheduleWithRunLoop(m, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+            tapInstalled = self.installEventTapOnCurrentRunLoop()
+            self.stateLock.lock()
+            self.engineRunLoop = CFRunLoopGetCurrent()
+            self.stateLock.unlock()
+            sem.signal()
+            while !Thread.current.isCancelled {
+                CFRunLoopRunInMode(.defaultMode, 0.3, false)
+            }
+        }
+        t.name = "com.xiabill.VibeHub.engine"
+        t.qualityOfService = .userInteractive
+        engineThread = t
+        t.start()
+        sem.wait()   // 等 schedule + tap 装好再返回，tapInstalled 经信号量同步后安全可读
+
+        if !tapInstalled {
             DispatchQueue.main.async { [weak self] in
                 self?.lastError = "已启动 HID 监听，但 CGEventTap 安装失败 —— 多半「辅助功能」权限未授予。Home/Back/Voice/Menu 仍可工作；方向键/Vol/Mute 的映射会与系统行为叠加。请到「系统设置 → 隐私与安全性 → 辅助功能」打开 VibeHub，重启 App。"
             }
@@ -1085,8 +1186,8 @@ final class RemoteEngine: ObservableObject {
         return true
     }
 
-    private func installEventTap() -> Bool {
-        if eventTap != nil { return true }
+    /// 在当前线程的 runloop 上创建并挂载 CGEventTap（仅引擎线程调用）。
+    private func installEventTapOnCurrentRunLoop() -> Bool {
         // keyDown / keyUp（10/11）+ NSSystemDefined（14）
         let mask: CGEventMask = (1 << 10) | (1 << 11) | (1 << 14)
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
@@ -1103,27 +1204,20 @@ final class RemoteEngine: ObservableObject {
             userInfo: selfPtr
         ) else { return false }
         let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        stateLock.lock()
         eventTap = tap
         tapRunLoopSource = src
-        // 专用后台线程跑 tap 的 runloop：吞键判断不再排在主线程 SwiftUI 布局后面，
-        // 避免面板打开时输入卡顿、tap 超时被系统 disable。
-        let t = Thread {
-            CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
-            CGEvent.tapEnable(tap: tap, enable: true)
-            while !Thread.current.isCancelled {
-                CFRunLoopRunInMode(.defaultMode, 0.3, false)
-            }
-        }
-        t.name = "com.xiabill.VibeHub.eventtap"
-        t.qualityOfService = .userInteractive
-        tapThread = t
-        t.start()
+        stateLock.unlock()
         return true
     }
 
     private func handleTap(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
+            // eventTap 加锁快照：stop()/restart() 在主线程置 nil 并释放，裸读会撞上 UB
+            stateLock.lock(); let tap = eventTap; stateLock.unlock()
+            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return Unmanaged.passUnretained(event)
         }
         // 自家事件直接放行（防止"OK→Enter 把自己也吞了"那类自吞 bug）
@@ -1153,18 +1247,30 @@ final class RemoteEngine: ObservableObject {
         clearSwallows()
         stopLearning()
         pressedButtonIds.removeAll()
-        if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
-        tapThread?.cancel()
-        tapThread = nil
-        if let src = tapRunLoopSource { CFRunLoopSourceInvalidate(src) }
-        eventTap = nil
-        tapRunLoopSource = nil
-        if let m = manager {
-            IOHIDManagerClose(m, IOOptionBits(kIOHIDOptionsTypeNone))
-            IOHIDManagerUnscheduleFromRunLoop(m, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+
+        stateLock.lock()
+        let tap = eventTap; let src = tapRunLoopSource; let rl = engineRunLoop
+        eventTap = nil; tapRunLoopSource = nil; engineRunLoop = nil
+        stateLock.unlock()
+        if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
+        let m = manager
+        // unschedule/invalidate 送回引擎线程自己的 runloop 执行（跨线程卸载不安全），
+        // 随后 cancel 让线程在 ≤0.3s 内自然退出。
+        if let rl {
+            CFRunLoopPerformBlock(rl, CFRunLoopMode.commonModes.rawValue) {
+                if let m {
+                    IOHIDManagerUnscheduleFromRunLoop(m, CFRunLoopGetCurrent(),
+                                                      CFRunLoopMode.defaultMode.rawValue)
+                }
+                if let src { CFRunLoopSourceInvalidate(src) }
+            }
+            CFRunLoopWakeUp(rl)
         }
+        engineThread?.cancel()
+        engineThread = nil
+        if let m { IOHIDManagerClose(m, IOOptionBits(kIOHIDOptionsTypeNone)) }
         manager = nil
-        openedDevices.removeAll()
+        stateLock.lock(); openedDevices.removeAll(); stateLock.unlock()
         DispatchQueue.main.async { [weak self] in self?.deviceConnected = false }
         isRunning = false
     }
@@ -1178,8 +1284,9 @@ final class RemoteEngine: ObservableObject {
         if wasRunning { _ = start() }
     }
 
+    // 设备匹配/移除回调在引擎线程（IOHIDManager schedule 在引擎 runloop）。
     private func onDeviceMatched(_ device: IOHIDDevice) {
-        openedDevices.insert(device)
+        stateLock.lock(); openedDevices.insert(device); stateLock.unlock()
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
         IOHIDDeviceRegisterInputValueCallback(device, { ctx, _, _, value in
             guard let ctx else { return }
@@ -1190,24 +1297,27 @@ final class RemoteEngine: ObservableObject {
     }
 
     private func onDeviceRemoved(_ device: IOHIDDevice) {
+        stateLock.lock()
         openedDevices.remove(device)
-        // 接收器被拔掉时 key-up 永远不来，repeat Timer 会无限发 chord。HID 回调在主
-        // runloop，repeatTimers 只在主线程访问，直接停掉所有 auto-repeat。
-        stopAllAutoRepeats()
-        // 同理：isDown 时加进 swallowSet 的条目等不到 key-up 的延迟摘除，
-        // 不清掉会永久吞真实键盘的同键码事件（与 stop() 的配对做法一致）。
+        let empty = openedDevices.isEmpty
+        stateLock.unlock()
+        // 接收器被拔掉时 key-up 永远不来：swallow 登记等不到抬起的延迟摘除（带锁直接清）；
+        // repeat Timer 会无限发 chord（timers 在主线程，hop 过去停）。
         clearSwallows()
-        pressedButtonIds.removeAll()   // 拔出时清空按下高亮，防残留（HID 回调在主 runloop）
         DispatchQueue.main.async { [weak self] in
-            self?.deviceConnected = !(self?.openedDevices.isEmpty ?? true)
+            guard let self else { return }
+            self.stopAllAutoRepeats()
+            self.pressedButtonIds.removeAll()
+            self.deviceConnected = !empty
         }
     }
 
-    // HID 回调在主 runloop（IOHIDManagerScheduleWithRunLoop main），@Published 更新安全。
+    // 学习态控制只在主线程调用（UI）；isLearning 供 UI 绑定，learnArmed 是引擎线程读的镜像。
     func startLearning() {
         learnedUsage = nil
         learnDuplicate = nil
         isLearning = true
+        learnArmed = true
         armLearnTimeout()
     }
 
@@ -1221,69 +1331,90 @@ final class RemoteEngine: ObservableObject {
 
     func stopLearning() {
         isLearning = false
+        learnArmed = false
         learnDuplicate = nil
         learnTimer?.invalidate()
         learnTimer = nil
     }
 
+    // HID 输入回调在引擎线程：swallow/greedy 同步登记（与 tap 同线程，天然先于事件
+    // 消费）；@Published / RemoteConfig 写入一律 hop 主线程。
     private func handleInputValue(_ value: IOHIDValue) {
         let element = IOHIDValueGetElement(value)
         let usagePage = IOHIDElementGetUsagePage(element)
         let usage = IOHIDElementGetUsage(element)
-        let intValue = IOHIDValueGetIntegerValue(value)
-        let isDown = (intValue != 0)
+        let isDown = (IOHIDValueGetIntegerValue(value) != 0)
 
         // 噪声：键盘页 reserved/rollover(<0x04) 与修饰键(0xE0-0xE7)、usage 0。这些不回显也不学习。
         let isNoise = usage == 0
             || (usagePage == 0x07 && (usage < 0x04 || (usage >= 0xE0 && usage <= 0xE7)))
-        let known = remoteButton(usagePage: usagePage, usage: usage)
+        let cfg = RemoteConfig.shared.engineSnapshot
+        let known = remoteButton(usagePage: usagePage, usage: usage, custom: cfg.customButtons)
 
-        // 回显与按下高亮：无论是否在列表 / 是否学习态都更新 lastHIDEvent（已知给 label，未知给 nil）；
-        // pressedButtonIds 只对已知按键维护。
+        // 自动收录去抖：判定要在更新钟之前算；任何非噪声按下（含已识别键）都更新钟，
+        // 这样影子 usage 无论跟在第几次按下后面，都落进 0.3s 内被挡住。
+        let now = CFAbsoluteTimeGetCurrent()
+        let debounceOK = now - lastAnyDownAt > 0.3
+        if isDown && !isNoise { lastAnyDownAt = now }
+
+        // 回显与按下高亮：无论是否在列表 / 是否学习态都更新 lastHIDEvent。
         if isDown && !isNoise {
-            lastHIDEvent = LastHIDEvent(usagePage: usagePage, usage: usage, buttonLabel: known?.label)
+            let label = known?.label
+            DispatchQueue.main.async { [weak self] in
+                self?.lastHIDEvent = LastHIDEvent(usagePage: usagePage, usage: usage,
+                                                  buttonLabel: label)
+            }
         }
         if let button = known {
-            if isDown { pressedButtonIds.insert(button.id) } else { pressedButtonIds.remove(button.id) }
+            let id = button.id
+            DispatchQueue.main.async { [weak self] in
+                if isDown { self?.pressedButtonIds.insert(id) } else { self?.pressedButtonIds.remove(id) }
+            }
         }
 
         // 学习态只拦截按下(value!=0)：key-up 必须放行到正常 dispatch，
-        // 否则学习前按住的键抬起被吞，auto-repeat 停不下来、swallowSet 残留。
-        if isLearning, isDown {
+        // 否则学习前按住的键抬起被吞，auto-repeat 停不下来、swallow 残留。
+        if learnArmed, isDown {
             if isNoise { return }
-            if known != nil {                    // 命中已存在按键 → 提示重复，保持学习态并重置超时
-                learnDuplicate = known?.label
-                armLearnTimeout()
+            if let dup = known?.label {          // 命中已存在按键 → 提示重复，保持学习态并重置超时
+                DispatchQueue.main.async { [weak self] in
+                    self?.learnDuplicate = dup
+                    self?.armLearnTimeout()
+                }
                 return
             }
-            learnDuplicate = nil
-            learnedUsage = LearnedUsage(page: usagePage, usage: usage)
-            stopLearning()
+            learnArmed = false   // 引擎侧立刻解除，防同一次按键的第二个 usage 又被捕获
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.learnDuplicate = nil
+                self.learnedUsage = LearnedUsage(page: usagePage, usage: usage)
+                self.stopLearning()
+            }
             return  // 学习态下不 dispatch
         }
         // 登记吞键（与"执行 chord"解耦）：全吞模式下含未映射 / 未识别的键
         if !isNoise {
-            captureSwallow(usagePage: usagePage, usage: usage, isDown: isDown, known: known)
+            captureSwallow(usagePage: usagePage, usage: usage, isDown: isDown,
+                           known: known, cfg: cfg)
         }
         // 面板打开时，未识别的新按键按下即自动收录，随后用户在列表里改名 + 配功能。
         // 白名单挡掉复合设备的影子 usage，去抖挡掉同一次按键的多 element 上报。
-        if known == nil, isDown, panelVisible,
-           isRealButtonUsage(usagePage: usagePage, usage: usage),
-           CFAbsoluteTimeGetCurrent() - lastAutoCaptureAt > 0.3 {
-            lastAutoCaptureAt = CFAbsoluteTimeGetCurrent()
+        if known == nil, isDown, debounceOK, panelVisible,
+           isRealButtonUsage(usagePage: usagePage, usage: usage) {
             let hex = String(format: "0x%02X:0x%02X", usagePage, usage)
-            RemoteConfig.shared.addCustomButton(label: "新按键 \(hex)",
-                                                usagePage: usagePage, usage: usage)
-            lastHIDEvent = LastHIDEvent(usagePage: usagePage, usage: usage,
-                                        buttonLabel: "新按键 \(hex)")
+            DispatchQueue.main.async { [weak self] in
+                RemoteConfig.shared.addCustomButton(label: "新按键 \(hex)",
+                                                    usagePage: usagePage, usage: usage)
+                self?.lastHIDEvent = LastHIDEvent(usagePage: usagePage, usage: usage,
+                                                  buttonLabel: "新按键 \(hex)")
+            }
             return
         }
         guard let button = known else { return }
-        dispatch(button: button, isDown: isDown)
+        dispatch(button: button, isDown: isDown, cfg: cfg)
     }
 
-    private func dispatch(button: RemoteButton, isDown: Bool) {
-        let cfg = RemoteConfig.shared
+    private func dispatch(button: RemoteButton, isDown: Bool, cfg: RemoteConfig.EngineSnapshot) {
         let mapping = cfg.mappings[button.id] ?? Mapping()
         guard mapping.enabled, !mapping.keys.isEmpty else { return }
         if isDown {
@@ -1292,9 +1423,12 @@ final class RemoteEngine: ObservableObject {
             if panelVisible { return }
             postChordDownAsync(keyIds: mapping.keys)
             postChordUpAsync(keyIds: mapping.keys)
-            startAutoRepeat(buttonId: button.id, keys: mapping.keys)
+            let id = button.id, keys = mapping.keys
+            DispatchQueue.main.async { [weak self] in self?.startAutoRepeat(buttonId: id, keys: keys) }
         } else {
-            stopAutoRepeat(buttonId: button.id)  // 抬起始终停 repeat（含面板打开前已启动的）
+            let id = button.id
+            // 抬起始终停 repeat（含面板打开前已启动的）；down/up 依次入主队列，顺序有保证
+            DispatchQueue.main.async { [weak self] in self?.stopAutoRepeat(buttonId: id) }
         }
     }
 
@@ -1393,6 +1527,7 @@ final class AudioInputMonitor: ObservableObject {
     }
 
     private func beginEngine() {
+        guard engine == nil else { return }   // 连点「测试」：权限回调异步窗口内可能进两次
         refresh()
         let eng = AVAudioEngine()
         let input = eng.inputNode
@@ -2527,6 +2662,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // transient 自动关 / performClose 都会回调这里：面板不可见后恢复按键执行绑定。
     func popoverDidClose(_ notification: Notification) {
         RemoteEngine.shared.panelVisible = false
+        AudioInputMonitor.shared.stopTest()   // 面板关了没人看电平，别让麦克风橙点继续亮
     }
 
     private func showContextMenu(from button: NSStatusBarButton, event: NSEvent) {
