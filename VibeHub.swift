@@ -1473,9 +1473,16 @@ final class RemoteEngine: ObservableObject {
 
 // MARK: - 共享：系统麦克风输入监测（当前输入设备 + 按需电平表）
 
+/// 一个可选作录音测试目标的输入设备（含 CoreAudio 设备 ID + 名称 + UID）。
+struct InputDevice: Identifiable, Hashable {
+    let id: AudioDeviceID
+    let name: String
+    let uid: String
+}
+
 /// 只读展示"系统默认输入设备"名称/UID（纯 CoreAudio 属性，不开麦、不需权限），
-/// 并提供按需的麦克风电平测试（点一下才开麦，超时/停止自动关，把对遥控器自带 mic
-/// 断流特性的影响降到最低）。
+/// 枚举全部输入设备供选择，并提供按需的麦克风电平测试（点一下才开麦，超时/停止
+/// 自动关，把对遥控器自带 mic 断流特性的影响降到最低）。
 final class AudioInputMonitor: ObservableObject {
     static let shared = AudioInputMonitor()
 
@@ -1486,6 +1493,9 @@ final class AudioInputMonitor: ObservableObject {
     @Published private(set) var testError: String?
     @Published private(set) var hasRecording = false  // 上次录音可回放
     @Published private(set) var isPlaying = false
+    @Published private(set) var inputDevices: [InputDevice] = []   // 全部可用输入设备（供多设备选择）
+    @Published var selectedDeviceID: AudioDeviceID? = nil          // nil = 跟随系统默认
+    @Published private(set) var defaultDeviceID: AudioDeviceID = 0 // 当前系统默认输入设备 ID
 
     private var engine: AVAudioEngine?
     private var timeoutItem: DispatchWorkItem?
@@ -1498,6 +1508,10 @@ final class AudioInputMonitor: ObservableObject {
         mSelector: kAudioHardwarePropertyDefaultInputDevice,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain)
+    private var devicesAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDevices,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
 
     private init() {
         refresh()
@@ -1505,19 +1519,69 @@ final class AudioInputMonitor: ObservableObject {
         AudioObjectAddPropertyListenerBlock(
             AudioObjectID(kAudioObjectSystemObject), &defaultInputAddr, DispatchQueue.main
         ) { [weak self] _, _ in self?.refresh() }
+        // 设备插拔（列表变化）时实时刷新可选设备列表
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &devicesAddr, DispatchQueue.main
+        ) { [weak self] _, _ in self?.refresh() }
     }
 
-    /// 刷新"当前系统默认输入设备"名称 + UID。纯只读属性，不激活麦克风。
+    /// 刷新"当前系统默认输入设备"名称 + UID，并枚举全部可用输入设备。纯只读属性，不激活麦克风。
     func refresh() {
         var devID = AudioDeviceID(0)
         var size = UInt32(MemoryLayout<AudioDeviceID>.size)
         let st = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
                                             &defaultInputAddr, 0, nil, &size, &devID)
-        guard st == noErr, devID != 0 else {
-            inputName = "（无输入设备）"; inputUID = ""; return
+        if st == noErr, devID != 0 {
+            defaultDeviceID = devID
+            inputName = deviceString(devID, kAudioObjectPropertyName) ?? "未知设备"
+            inputUID  = deviceString(devID, kAudioDevicePropertyDeviceUID) ?? ""
+        } else {
+            defaultDeviceID = 0
+            inputName = "（无输入设备）"; inputUID = ""
         }
-        inputName = deviceString(devID, kAudioObjectPropertyName) ?? "未知设备"
-        inputUID  = deviceString(devID, kAudioDevicePropertyDeviceUID) ?? ""
+        refreshInputDevices()
+    }
+
+    /// 枚举系统全部音频设备，保留有输入通道的设备（可作录音测试目标），按名称排序。
+    private func refreshInputDevices() {
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject),
+                                             &devicesAddr, 0, nil, &size) == noErr, size > 0 else {
+            inputDevices = []; selectedDeviceID = nil; return
+        }
+        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+        var ids = [AudioDeviceID](repeating: 0, count: count)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                         &devicesAddr, 0, nil, &size, &ids) == noErr else {
+            inputDevices = []; selectedDeviceID = nil; return
+        }
+        var result: [InputDevice] = []
+        for id in ids where inputChannelCount(id) > 0 {
+            let name = deviceString(id, kAudioObjectPropertyName) ?? "未知设备"
+            let uid  = deviceString(id, kAudioDevicePropertyDeviceUID) ?? ""
+            result.append(InputDevice(id: id, name: name, uid: uid))
+        }
+        inputDevices = result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        // 选中的设备若已拔掉，退回跟随系统默认
+        if let sel = selectedDeviceID, !inputDevices.contains(where: { $0.id == sel }) {
+            selectedDeviceID = nil
+        }
+    }
+
+    /// 读设备输入 scope 的流配置，返回输入通道总数（0 表示纯输出设备）。
+    private func inputChannelCount(_ dev: AudioDeviceID) -> Int {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(dev, &addr, 0, nil, &size) == noErr, size > 0 else { return 0 }
+        let ptr = UnsafeMutableRawPointer.allocate(byteCount: Int(size),
+                                                    alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { ptr.deallocate() }
+        guard AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, ptr) == noErr else { return 0 }
+        let bufList = UnsafeMutableAudioBufferListPointer(ptr.assumingMemoryBound(to: AudioBufferList.self))
+        return bufList.reduce(0) { $0 + Int($1.mNumberChannels) }
     }
 
     private func deviceString(_ dev: AudioDeviceID, _ selector: AudioObjectPropertySelector) -> String? {
@@ -1549,6 +1613,19 @@ final class AudioInputMonitor: ObservableObject {
         refresh()
         let eng = AVAudioEngine()
         let input = eng.inputNode
+        // 绑定所选麦克风（nil 时用系统默认）：把设备写进 input 的 AudioUnit，
+        // 让引擎采到指定设备而非系统默认，实现多设备分别测试。
+        let target = selectedDeviceID ?? defaultDeviceID
+        if target != 0, let au = input.audioUnit {
+            var dev = target
+            let st = AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice,
+                                          kAudioUnitScope_Global, 0, &dev,
+                                          UInt32(MemoryLayout<AudioDeviceID>.size))
+            if st != noErr {
+                testError = "无法绑定所选麦克风（错误 \(st)），已回退系统默认输入"
+                // 不 return：继续用默认设备录，比直接失败友好
+            }
+        }
         let fmt = input.inputFormat(forBus: 0)
         guard fmt.sampleRate > 0, fmt.channelCount > 0 else {
             testError = "无法读取输入设备格式（设备可能未就绪或被占用）"; return
@@ -2418,23 +2495,39 @@ struct RemoteTabView: View {
                     }.buttonStyle(.borderless).font(.caption)
                 }
             }
-            // 当前系统默认输入设备 + 是否遥控器徽标
-            HStack(spacing: 6) {
-                Image(systemName: "waveform").font(.caption).foregroundColor(.secondary)
-                Text(audio.inputName)
-                    .font(.system(size: 11, design: .monospaced))
-                    .lineLimit(1).truncationMode(.middle)
-                if inputLooksLikeRemote {
-                    Text("遥控器").font(.caption2)
-                        .padding(.horizontal, 5).padding(.vertical, 1)
-                        .background(Color.green.opacity(0.18))
-                        .foregroundColor(.green).cornerRadius(3)
+            // 可选输入设备列表：点选要测试的麦克风，不选则跟随系统默认
+            ForEach(audio.inputDevices) { dev in
+                Button {
+                    // 再点已选中项 → 取消选择，退回跟随系统默认
+                    audio.selectedDeviceID = (audio.selectedDeviceID == dev.id) ? nil : dev.id
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: isSelected(dev) ? "checkmark.circle.fill" : "circle")
+                            .font(.caption)
+                            .foregroundColor(isSelected(dev) ? .accentColor : .secondary)
+                        Text(dev.name)
+                            .font(.system(size: 11, design: .monospaced))
+                            .lineLimit(1).truncationMode(.middle)
+                            .foregroundColor(.primary)
+                        if dev.id == audio.defaultDeviceID {
+                            Text("系统默认").font(.caption2)
+                                .padding(.horizontal, 5).padding(.vertical, 1)
+                                .background(Color.secondary.opacity(0.18))
+                                .foregroundColor(.secondary).cornerRadius(3)
+                        }
+                        if looksLikeRemote(name: dev.name, uid: dev.uid) {
+                            Text("遥控器").font(.caption2)
+                                .padding(.horizontal, 5).padding(.vertical, 1)
+                                .background(Color.green.opacity(0.18))
+                                .foregroundColor(.green).cornerRadius(3)
+                        }
+                        Spacer(minLength: 0)
+                    }
                 }
-                Spacer(minLength: 0)
+                .buttonStyle(.plain)
             }
-            Text(inputLooksLikeRemote
-                 ? "当前系统输入正是这个遥控器的麦克风"
-                 : "当前系统输入不是遥控器（或设备名未能匹配）")
+            .disabled(audio.isTesting || audio.isPlaying)
+            Text("点选要测试的麦克风；不选则跟随系统默认。")
                 .font(.caption2).foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             // 电平表（仅测试期间）
@@ -2463,17 +2556,23 @@ struct RemoteTabView: View {
         .onDisappear { audio.stopTest() }
     }
 
-    /// best-effort 判断"系统默认输入设备是不是当前目标遥控器"。
+    /// 跟随默认时，默认设备显示为选中态。
+    private func isSelected(_ dev: InputDevice) -> Bool {
+        audio.selectedDeviceID == dev.id
+            || (audio.selectedDeviceID == nil && dev.id == audio.defaultDeviceID)
+    }
+
+    /// best-effort 判断"某输入设备是不是当前目标遥控器"。
     /// 先看设备 UID 里是否同时含目标 VID+PID 的 hex（强信号），再退到设备名/厂商名模糊匹配。
     // ponytail: 名称启发式，跨设备命名不一致可能漏判；漏判时只是不显示徽标，不会误接管。
-    private var inputLooksLikeRemote: Bool {
-        let uid = audio.inputUID.lowercased()
+    private func looksLikeRemote(name: String, uid: String) -> Bool {
+        let uid = uid.lowercased()
         if !uid.isEmpty {
             let vidHex = String(format: "%04x", config.targetVID)
             let pidHex = String(format: "%04x", config.targetPID)
             if uid.contains(vidHex) && uid.contains(pidHex) { return true }
         }
-        let inNorm = normalizeName(audio.inputName)
+        let inNorm = normalizeName(name)
         guard !inNorm.isEmpty else { return false }
         let target = detectedDevices.first {
             $0.vendorId == config.targetVID && $0.productId == config.targetPID
