@@ -2455,8 +2455,9 @@ struct RemoteTabView: View {
 
 // MARK: - UI: 主面板（segmented picker + ZStack，Tab 切换不重建视图树）
 
-/// 上报 Tab 内容实际高度，驱动「不超上限自适应、超上限内部滚动」。
-private struct TabsHeightKey: PreferenceKey {
+/// 上报面板内容自然高度；AppDelegate 据此命令式设置 popover.contentSize。
+/// （高度协商不进 AutoLayout：约束驱动的自适应在 macOS 27 会递归爆栈，见 AppDelegate 注释）
+private struct ContentHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = max(value, nextValue())
@@ -2464,23 +2465,30 @@ private struct TabsHeightKey: PreferenceKey {
 }
 
 struct ContentView: View {
+    var heightChanged: (CGFloat) -> Void = { _ in }
     @ObservedObject var loginItem = LaunchAtLogin.shared
     @State private var selectedTab: String = "airpods"
     @State private var recordingRowId: String? = nil   // 全局唯一录制行；切 Tab 时清空
-    @State private var tabsHeight: CGFloat = 400
-
-    /// 内容区高度上限。popover 高度无界时，高且动态的内容（自定义键行、条件卡片）
-    /// 会让 NSPopover 的 AutoLayout 求解递归爆栈（两次崩溃同栈：NSISEngine
-    /// _flushPendingRemovals 栈溢出）。不超上限保持自适应不滚动，超过转内部滚动。
-    private var maxTabsHeight: CGFloat {
-        ((NSScreen.main?.visibleFrame.height) ?? 900) - 160
-    }
 
     private var appVersion: String {
         (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "dev"
     }
 
     var body: some View {
+        // 整体套 ScrollView：内容拿"无限高度提案"算自然高度（与窗口高度无循环依赖），
+        // 测量结果经 heightChanged 命令式设给 popover；窗口不够高时自然获得滚动。
+        ScrollView(.vertical, showsIndicators: false) {
+            inner
+                .background(GeometryReader { g in
+                    Color.clear.preference(key: ContentHeightKey.self, value: g.size.height)
+                })
+        }
+        .frame(width: 360)
+        .onPreferenceChange(ContentHeightKey.self) { heightChanged($0) }
+        .background(Color(NSColor.windowBackgroundColor))
+    }
+
+    private var inner: some View {
         VStack(spacing: 0) {
             Picker("", selection: $selectedTab) {
                 Text("AirPods").tag("airpods")
@@ -2495,23 +2503,15 @@ struct ContentView: View {
 
             Divider()
 
-            ScrollView(.vertical, showsIndicators: false) {
-                ZStack(alignment: .top) {
-                    AirPodsTabView(recordingRowId: $recordingRowId)
-                        .opacity(selectedTab == "airpods" ? 1 : 0)
-                        .allowsHitTesting(selectedTab == "airpods")
-                    RemoteTabView(recordingRowId: $recordingRowId)
-                        .opacity(selectedTab == "remote" ? 1 : 0)
-                        .allowsHitTesting(selectedTab == "remote")
-                }
-                .frame(width: 360)
-                .background(GeometryReader { g in
-                    Color.clear.preference(key: TabsHeightKey.self, value: g.size.height)
-                })
+            ZStack(alignment: .top) {
+                AirPodsTabView(recordingRowId: $recordingRowId)
+                    .opacity(selectedTab == "airpods" ? 1 : 0)
+                    .allowsHitTesting(selectedTab == "airpods")
+                RemoteTabView(recordingRowId: $recordingRowId)
+                    .opacity(selectedTab == "remote" ? 1 : 0)
+                    .allowsHitTesting(selectedTab == "remote")
             }
             .frame(width: 360)
-            .frame(height: min(max(tabsHeight, 200), maxTabsHeight))
-            .onPreferenceChange(TabsHeightKey.self) { tabsHeight = $0 }
 
             Divider()
 
@@ -2541,7 +2541,6 @@ struct ContentView: View {
             }
         }
         .frame(width: 360)
-        .background(Color(NSColor.windowBackgroundColor))
     }
 }
 
@@ -2602,9 +2601,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 预热：先把 host 挂到一个屏外隐藏 window 里强制 SwiftUI 渲染整棵树，
         // 然后再交给 popover。否则 SwiftUI 只在视图真正进入 window 时才 build body，
         // 首次点击图标时要现场建整棵树。
-        // sizingOptions=.preferredContentSize 让 host 把 SwiftUI 理想高度同步给 popover（面板自适应高度）。
-        let host = NSHostingController(rootView: ContentView())
-        host.sizingOptions = [.preferredContentSize]
+        // sizingOptions=[]：禁用 NSHostingController 的自动尺寸约束。约束驱动的
+        // "popover 高度跟随内容"在 macOS 27 的 CoreAutoLayout 上会递归爆栈（三次
+        // 崩溃同栈：NSISEngine _flushPendingRemovals）。高度改为 SwiftUI 侧测量
+        // 自然高度后，经 heightChanged 回调在这里命令式 setContentSize——约束系统
+        // 永远只解一个固定尺寸，超屏时 ContentView 的外层 ScrollView 自然接管滚动。
+        let host = NSHostingController(rootView: ContentView(heightChanged: { [weak self] h in
+            guard let self, h > 0 else { return }
+            let cap = ((NSScreen.main?.visibleFrame.height) ?? 900) - 120
+            let newH = min(max(h, 240), cap).rounded()
+            DispatchQueue.main.async {
+                if abs(self.popover.contentSize.height - newH) > 0.5 {
+                    self.popover.contentSize = NSSize(width: 360, height: newH)
+                }
+            }
+        }))
+        host.sizingOptions = []
+        popover.contentSize = NSSize(width: 360, height: 640)   // 首帧兜底，测量到位后校正
         let warmup = NSWindow(
             contentRect: NSRect(x: -50000, y: -50000, width: 360, height: 900),
             styleMask: [.borderless], backing: .buffered, defer: false)
