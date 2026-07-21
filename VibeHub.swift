@@ -805,6 +805,7 @@ final class RemoteConfig: ObservableObject {
     private let arEnabledKey     = "vibehub_remote_autorepeat_enabled"
     private let arInitialMsKey   = "vibehub_remote_autorepeat_initial_ms"
     private let arIntervalMsKey  = "vibehub_remote_autorepeat_interval_ms"
+    private let tapHoldMsKey     = "vibehub_remote_tap_hold_ms"
     private let captureAllKey    = "vibehub_remote_capture_all"
     private let vidKey           = "vibehub_remote_target_vid"
     private let pidKey           = "vibehub_remote_target_pid"
@@ -826,6 +827,14 @@ final class RemoteConfig: ObservableObject {
     }
     @Published var autoRepeatIntervalMs: Int {
         didSet { UserDefaults.standard.set(autoRepeatIntervalMs, forKey: arIntervalMsKey) }
+    }
+    /// 点按模式 chord 按下→抬起的停留时长。12ms 的"机器点按"会被部分程序当误触
+    /// 丢弃（Typeless 实测 <100ms 取消、≥100ms 正常识别）；真人按键本就是 80-150ms。
+    @Published var tapHoldMs: Int {
+        didSet {
+            UserDefaults.standard.set(tapHoldMs, forKey: tapHoldMsKey)
+            updateEngineSnapshot()
+        }
     }
     /// 全吞模式：开启后遥控器任意键（含未映射 / 未识别）的系统原生行为都被吞掉。
     @Published var captureAllKeys: Bool {
@@ -856,6 +865,7 @@ final class RemoteConfig: ObservableObject {
         self.autoRepeatEnabled        = (d.object(forKey: arEnabledKey)   as? Bool) ?? true
         self.autoRepeatInitialDelayMs = (d.object(forKey: arInitialMsKey) as? Int)  ?? 500
         self.autoRepeatIntervalMs     = (d.object(forKey: arIntervalMsKey) as? Int) ?? 100
+        self.tapHoldMs                = (d.object(forKey: tapHoldMsKey) as? Int) ?? 100
         self.captureAllKeys           = (d.object(forKey: captureAllKey) as? Bool) ?? true
         self.targetVID                = (d.object(forKey: vidKey) as? Int) ?? DEFAULT_TARGET_VID
         self.targetPID                = (d.object(forKey: pidKey) as? Int) ?? DEFAULT_TARGET_PID
@@ -883,9 +893,10 @@ final class RemoteConfig: ObservableObject {
         let mappings: [String: Mapping]
         let customButtons: [CustomRemoteButton]
         let captureAllKeys: Bool
+        let tapHoldMs: Int
     }
     private let snapLock = NSLock()
-    private var snap = EngineSnapshot(mappings: [:], customButtons: [], captureAllKeys: true)
+    private var snap = EngineSnapshot(mappings: [:], customButtons: [], captureAllKeys: true, tapHoldMs: 100)
     var engineSnapshot: EngineSnapshot {
         snapLock.lock(); defer { snapLock.unlock() }
         return snap
@@ -893,7 +904,7 @@ final class RemoteConfig: ObservableObject {
     private func updateEngineSnapshot() {
         snapLock.lock()
         snap = EngineSnapshot(mappings: mappings, customButtons: customButtons,
-                              captureAllKeys: captureAllKeys)
+                              captureAllKeys: captureAllKeys, tapHoldMs: tapHoldMs)
         snapLock.unlock()
     }
 
@@ -933,6 +944,7 @@ final class RemoteConfig: ObservableObject {
         autoRepeatEnabled = true
         autoRepeatInitialDelayMs = 500
         autoRepeatIntervalMs = 100
+        tapHoldMs = 100
         captureAllKeys = true
         targetVID = DEFAULT_TARGET_VID
         targetPID = DEFAULT_TARGET_PID
@@ -1485,10 +1497,13 @@ final class RemoteEngine: ObservableObject {
                 vhLog("chord hold-down \(mapping.keys.joined(separator: "+"))")
                 postChordDownAsync(keyIds: mapping.keys)
             } else {
-                vhLog("chord tap \(mapping.keys.joined(separator: "+"))")
+                vhLog("chord tap \(mapping.keys.joined(separator: "+")) hold=\(cfg.tapHoldMs)ms")
                 postChordDownAsync(keyIds: mapping.keys)
-                postChordUpAsync(keyIds: mapping.keys)
+                // 停留 tapHoldMs 再抬起：12ms 机器点按会被 Typeless 等程序当误触丢弃
                 let id = button.id, keys = mapping.keys
+                DispatchQueue.main.asyncAfter(deadline: .now() + Double(cfg.tapHoldMs) / 1000.0) {
+                    postChordUpAsync(keyIds: keys)
+                }
                 DispatchQueue.main.async { [weak self] in self?.startAutoRepeat(buttonId: id, keys: keys) }
             }
         } else {
@@ -2497,6 +2512,19 @@ struct RemoteTabView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            Divider()
+            HStack(spacing: 6) {
+                Text("点按停留").font(.caption).frame(width: 56, alignment: .leading)
+                Slider(value: Binding(
+                    get: { Double(config.tapHoldMs) },
+                    set: { config.tapHoldMs = Int($0) }
+                ), in: 30...300, step: 10)
+                Text("\(config.tapHoldMs) ms")
+                    .font(.caption).monospacedDigit().frame(width: 56, alignment: .trailing)
+            }
+            Text("点按模式按键从按下到抬起的停留时长。太短会被部分程序当误触（Typeless 需 ≥100ms）。")
+                .font(.caption2).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             Divider()
             HStack {
                 Text("长按自动重复").font(.subheadline.weight(.semibold))
