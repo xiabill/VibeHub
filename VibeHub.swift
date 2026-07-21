@@ -298,8 +298,35 @@ private let NX_KEYTYPE_NEXT:       Int32 = 17
 private let NX_KEYTYPE_FAST:       Int32 = 19
 private let NX_KEYTYPE_PREVIOUS:   Int32 = 18
 
-// MARK: - 共享：诊断日志（统一日志，Console/log show 可拉；只记遥控器链路与吞键决策，不记用户正常键盘输入）
-func vhLog(_ s: String) { NSLog("VH| %@", s) }
+// MARK: - 共享：诊断日志（只记遥控器链路与吞键决策，不记用户正常键盘输入）
+// 双写：NSLog（Console.app 可看）+ 追加 ~/Library/Logs/VibeHub.log（脚本可直接读，
+// 本机 log show 读统一日志受限）。文件超 5MB 直接截断重来——诊断日志不值得滚动归档。
+private let vhLogURL = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Logs/VibeHub.log")
+private let vhLogQueue = DispatchQueue(label: "com.xiabill.VibeHub.log")
+private let vhLogTimeFmt: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "MM-dd HH:mm:ss.SSS"
+    return f
+}()
+func vhLog(_ s: String) {
+    NSLog("VH| %@", s)
+    vhLogQueue.async {
+        let line = "\(vhLogTimeFmt.string(from: Date())) \(s)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        if let size = (try? FileManager.default.attributesOfItem(atPath: vhLogURL.path)[.size]) as? Int,
+           size > 5_000_000 {
+            try? FileManager.default.removeItem(at: vhLogURL)
+        }
+        if let h = try? FileHandle(forWritingTo: vhLogURL) {
+            h.seekToEndOfFile()
+            h.write(data)
+            try? h.close()
+        } else {
+            try? data.write(to: vhLogURL)
+        }
+    }
+}
 
 // MARK: - 共享：自家事件 magic（让 tap 识别自己 post 的事件，避免自吞）
 
