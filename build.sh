@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 APP_NAME="VibeHub"
 APP_BUNDLE="${APP_NAME}.app"
 BUNDLE_ID="com.xiabill.VibeHub"
-VERSION="1.3.2"
+VERSION="1.4.1"
 
 # 1. 生成图标（不存在时）
 if [[ ! -f AppIcon.icns ]]; then
@@ -33,6 +33,7 @@ else
     -target arm64-apple-macos13.0 \
     -framework Cocoa -framework SwiftUI -framework CoreGraphics \
     -framework ServiceManagement -framework IOKit \
+    -framework AVFoundation -framework CoreAudio \
     VibeHub.swift \
     -o "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 fi
@@ -70,6 +71,7 @@ ${ICON_NAME_KEY}
   <key>LSUIElement</key><true/>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>用于测试遥控器/系统麦克风的输入电平，仅在你点击「测试麦克风」时临时开启。</string>
   <key>NSHumanReadableCopyright</key><string>© 2026 xiabill</string>
 </dict>
 </plist>

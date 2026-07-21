@@ -6,6 +6,8 @@ import CoreGraphics
 import Combine
 import ServiceManagement
 import Darwin
+import CoreAudio
+import AVFoundation
 
 // MARK: - 共享：按键目录（chord 目标按键可选项）
 
@@ -295,6 +297,36 @@ private let NX_KEYTYPE_NEXT:       Int32 = 17
 // 按钮多数发 18（真正的 NX_KEYTYPE_PREVIOUS）。两者都映射到"三击"。
 private let NX_KEYTYPE_FAST:       Int32 = 19
 private let NX_KEYTYPE_PREVIOUS:   Int32 = 18
+
+// MARK: - 共享：诊断日志（只记遥控器链路与吞键决策，不记用户正常键盘输入）
+// 双写：NSLog（Console.app 可看）+ 追加 ~/Library/Logs/VibeHub.log（脚本可直接读，
+// 本机 log show 读统一日志受限）。文件超 5MB 直接截断重来——诊断日志不值得滚动归档。
+private let vhLogURL = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Logs/VibeHub.log")
+private let vhLogQueue = DispatchQueue(label: "com.xiabill.VibeHub.log")
+private let vhLogTimeFmt: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "MM-dd HH:mm:ss.SSS"
+    return f
+}()
+func vhLog(_ s: String) {
+    NSLog("VH| %@", s)
+    vhLogQueue.async {
+        let line = "\(vhLogTimeFmt.string(from: Date())) \(s)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        if let size = (try? FileManager.default.attributesOfItem(atPath: vhLogURL.path)[.size]) as? Int,
+           size > 5_000_000 {
+            try? FileManager.default.removeItem(at: vhLogURL)
+        }
+        if let h = try? FileHandle(forWritingTo: vhLogURL) {
+            h.seekToEndOfFile()
+            h.write(data)
+            try? h.close()
+        } else {
+            try? data.write(to: vhLogURL)
+        }
+    }
+}
 
 // MARK: - 共享：自家事件 magic（让 tap 识别自己 post 的事件，避免自吞）
 
@@ -694,13 +726,30 @@ func customToRemoteButton(_ c: CustomRemoteButton) -> RemoteButton {
                  passthrough: inferPassthrough(usagePage: c.usagePage, usage: c.usage))
 }
 
+/// 自动收录白名单：只把"看起来是真实按键"的 usage 当新按键。
+/// 遥控器真实按键都落在 Keyboard(0x07) 实体键区或 Consumer(0x0C) 控件区；
+/// 复合设备一次按键常在 vendor / generic-desktop 页附带影子 element，这些一律不收录。
+func isRealButtonUsage(usagePage: UInt32, usage: UInt32) -> Bool {
+    switch usagePage {
+    case 0x07: return usage >= 0x04 && usage <= 0xA4       // Keyboard/Keypad 实体键（排除 modifier/reserved）
+    case 0x0C: return usage >= 0x20 && usage <= 0x2FF       // Consumer 控件
+    default:   return false
+    }
+}
+
 /// 先查硬编码 12 颗按键，未命中再查用户自定义按键。
-func remoteButton(usagePage: UInt32, usage: UInt32) -> RemoteButton? {
+/// custom 显式传入：引擎线程用 EngineSnapshot 的拷贝，不跨线程读 RemoteConfig。
+func remoteButton(usagePage: UInt32, usage: UInt32, custom: [CustomRemoteButton]) -> RemoteButton? {
     if let b = buttonByUsage[UInt64(usagePage) << 32 | UInt64(usage)] { return b }
-    if let c = RemoteConfig.shared.customButtons.first(where: {
+    if let c = custom.first(where: {
         $0.usagePage == usagePage && $0.usage == usage
     }) { return customToRemoteButton(c) }
     return nil
+}
+
+/// 主线程便捷版（直接读 shared config）。
+func remoteButton(usagePage: UInt32, usage: UInt32) -> RemoteButton? {
+    remoteButton(usagePage: usagePage, usage: usage, custom: RemoteConfig.shared.customButtons)
 }
 
 /// 默认目标设备：XING WEI 2.4G USB（常见国产 2.4G TV 遥控器接收器）
@@ -756,12 +805,17 @@ final class RemoteConfig: ObservableObject {
     private let arEnabledKey     = "vibehub_remote_autorepeat_enabled"
     private let arInitialMsKey   = "vibehub_remote_autorepeat_initial_ms"
     private let arIntervalMsKey  = "vibehub_remote_autorepeat_interval_ms"
+    private let tapHoldMsKey     = "vibehub_remote_tap_hold_ms"
+    private let captureAllKey    = "vibehub_remote_capture_all"
     private let vidKey           = "vibehub_remote_target_vid"
     private let pidKey           = "vibehub_remote_target_pid"
     private let customKey        = "vibehub_remote_custom_v1"
 
     @Published var mappings: [String: Mapping] { didSet { saveMappings() } }
     @Published var customButtons: [CustomRemoteButton] { didSet { saveCustom() } }
+    /// 本次会话内自动收录、尚未配置的按键 id（不持久化）：列表里标「新发现」，
+    /// 用户改名或绑定后移除标记。
+    @Published var newButtonIds: Set<String> = []
     @Published var moduleEnabled: Bool {
         didSet { UserDefaults.standard.set(moduleEnabled, forKey: enabledKey) }
     }
@@ -773,6 +827,21 @@ final class RemoteConfig: ObservableObject {
     }
     @Published var autoRepeatIntervalMs: Int {
         didSet { UserDefaults.standard.set(autoRepeatIntervalMs, forKey: arIntervalMsKey) }
+    }
+    /// 点按模式 chord 按下→抬起的停留时长。12ms 的"机器点按"会被部分程序当误触
+    /// 丢弃（Typeless 实测 <100ms 取消、≥100ms 正常识别）；真人按键本就是 80-150ms。
+    @Published var tapHoldMs: Int {
+        didSet {
+            UserDefaults.standard.set(tapHoldMs, forKey: tapHoldMsKey)
+            updateEngineSnapshot()
+        }
+    }
+    /// 全吞模式：开启后遥控器任意键（含未映射 / 未识别）的系统原生行为都被吞掉。
+    @Published var captureAllKeys: Bool {
+        didSet {
+            UserDefaults.standard.set(captureAllKeys, forKey: captureAllKey)
+            updateEngineSnapshot()
+        }
     }
     @Published var targetVID: Int { didSet { UserDefaults.standard.set(targetVID, forKey: vidKey) } }
     @Published var targetPID: Int { didSet { UserDefaults.standard.set(targetPID, forKey: pidKey) } }
@@ -796,20 +865,47 @@ final class RemoteConfig: ObservableObject {
         self.autoRepeatEnabled        = (d.object(forKey: arEnabledKey)   as? Bool) ?? true
         self.autoRepeatInitialDelayMs = (d.object(forKey: arInitialMsKey) as? Int)  ?? 500
         self.autoRepeatIntervalMs     = (d.object(forKey: arIntervalMsKey) as? Int) ?? 100
+        self.tapHoldMs                = (d.object(forKey: tapHoldMsKey) as? Int) ?? 100
+        self.captureAllKeys           = (d.object(forKey: captureAllKey) as? Bool) ?? true
         self.targetVID                = (d.object(forKey: vidKey) as? Int) ?? DEFAULT_TARGET_VID
         self.targetPID                = (d.object(forKey: pidKey) as? Int) ?? DEFAULT_TARGET_PID
+        updateEngineSnapshot()   // init 内赋值不触发 didSet，手动建立首份快照
     }
 
     private func saveMappings() {
         if let data = try? JSONEncoder().encode(mappings) {
             UserDefaults.standard.set(data, forKey: storeKey)
         }
+        updateEngineSnapshot()
     }
 
     private func saveCustom() {
         if let data = try? JSONEncoder().encode(customButtons) {
             UserDefaults.standard.set(data, forKey: customKey)
         }
+        updateEngineSnapshot()
+    }
+
+    // —— 引擎线程只读快照 ——
+    // mappings/customButtons/captureAllKeys 在主线程写入，HID/tap 后台线程读取
+    // 必须走快照拷贝，跨线程直接读 Swift 容器是数据竞争（可崩）。
+    struct EngineSnapshot {
+        let mappings: [String: Mapping]
+        let customButtons: [CustomRemoteButton]
+        let captureAllKeys: Bool
+        let tapHoldMs: Int
+    }
+    private let snapLock = NSLock()
+    private var snap = EngineSnapshot(mappings: [:], customButtons: [], captureAllKeys: true, tapHoldMs: 100)
+    var engineSnapshot: EngineSnapshot {
+        snapLock.lock(); defer { snapLock.unlock() }
+        return snap
+    }
+    private func updateEngineSnapshot() {
+        snapLock.lock()
+        snap = EngineSnapshot(mappings: mappings, customButtons: customButtons,
+                              captureAllKeys: captureAllKeys, tapHoldMs: tapHoldMs)
+        snapLock.unlock()
     }
 
     /// 添加自学习按键：追加到 customButtons 并建一条默认映射。
@@ -820,13 +916,24 @@ final class RemoteConfig: ObservableObject {
         customButtons.append(CustomRemoteButton(id: id, label: label,
                                                 usagePage: usagePage, usage: usage))
         mappings[id] = Mapping()
+        newButtonIds.insert(id)
     }
 
     /// 删除自学习按键：清掉按键、映射，并停掉可能残留的 auto-repeat。
     func removeCustomButton(_ id: String) {
         customButtons.removeAll { $0.id == id }
         mappings.removeValue(forKey: id)
+        newButtonIds.remove(id)
         RemoteEngine.shared.stopAutoRepeat(buttonId: id)
+    }
+
+    /// 一键清空所有自定义按键（及其映射、残留 auto-repeat）。
+    func clearAllCustomButtons() {
+        let ids = customButtons.map { $0.id }
+        for id in ids { RemoteEngine.shared.stopAutoRepeat(buttonId: id) }
+        customButtons.removeAll()
+        for id in ids { mappings.removeValue(forKey: id) }
+        newButtonIds.removeAll()
     }
 
     func resetToDefaults() {
@@ -837,6 +944,8 @@ final class RemoteConfig: ObservableObject {
         autoRepeatEnabled = true
         autoRepeatInitialDelayMs = 500
         autoRepeatIntervalMs = 100
+        tapHoldMs = 100
+        captureAllKeys = true
         targetVID = DEFAULT_TARGET_VID
         targetPID = DEFAULT_TARGET_PID
     }
@@ -862,7 +971,23 @@ final class RemoteConfig: ObservableObject {
     func binding(for buttonId: String) -> Binding<Mapping> {
         Binding(
             get: { self.mappings[buttonId] ?? Mapping() },
-            set: { self.mappings[buttonId] = $0 }
+            set: {
+                self.mappings[buttonId] = $0
+                if !$0.keys.isEmpty { self.newButtonIds.remove(buttonId) }  // 绑定即视为已配置
+            }
+        )
+    }
+
+    /// 自定义按键改名绑定（改动即随 customButtons.didSet 持久化）。
+    func customLabelBinding(_ id: String) -> Binding<String> {
+        Binding(
+            get: { self.customButtons.first { $0.id == id }?.label ?? "" },
+            set: { new in
+                if let i = self.customButtons.firstIndex(where: { $0.id == id }) {
+                    self.customButtons[i].label = new
+                    self.newButtonIds.remove(id)   // 改名即视为已配置
+                }
+            }
         )
     }
 }
@@ -883,42 +1008,144 @@ final class RemoteEngine: ObservableObject {
     @Published var learnDuplicate: String?   // 学习时命中已存在按键 → 该按键 label（提示重复）
     private var learnTimer: Timer?
 
-    // —— 按下反馈 / 最近按键回显（HID 回调在主 runloop，@Published 更新安全）——
-    struct LastHIDEvent { let usagePage: UInt32; let usage: UInt32; let buttonLabel: String? }
+    // —— 按下反馈 / 最近按键回显（HID 回调在引擎线程，更新一律 hop 主线程）——
     @Published var pressedButtonIds: Set<String> = []   // 仅对已知按键维护，抬起移除
-    @Published var lastHIDEvent: LastHIDEvent?
 
     /// 面板打开期间为 true：仍吞原生事件、仍更新回显，但不执行绑定 chord / auto-repeat。
-    /// 非 @Published，只在主线程读写（AppDelegate 管理生命周期）。
-    var panelVisible = false
+    /// 主线程写（AppDelegate 管理生命周期）、引擎线程读，走 stateLock。
+    var panelVisible: Bool {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _panelVisible }
+        set { stateLock.lock(); _panelVisible = newValue; stateLock.unlock() }
+    }
+    private var _panelVisible = false
+    /// isLearning 的引擎侧镜像：@Published 本体只在主线程读写供 UI 绑定，引擎线程读镜像。
+    private var learnArmed: Bool {
+        get { stateLock.lock(); defer { stateLock.unlock() }; return _learnArmed }
+        set { stateLock.lock(); _learnArmed = newValue; stateLock.unlock() }
+    }
+    private var _learnArmed = false
+    /// 保护 _panelVisible/_learnArmed/eventTap/engineRunLoop/openedDevices 的跨线程访问。
+    private let stateLock = NSLock()
 
     private var manager: IOHIDManager?
-    private var openedDevices: Set<IOHIDDevice> = []
-    private var eventTap: CFMachPort?
+    private var openedDevices: Set<IOHIDDevice> = []   // 读写走 stateLock（设备回调在引擎线程，stop 在主线程）
+    private var eventTap: CFMachPort?                  // 读写走 stateLock（tap 回调在引擎线程，stop 在主线程）
     private var tapRunLoopSource: CFRunLoopSource?
-    private var repeatTimers: [String: Timer] = [:]
+    private var engineThread: Thread?                  // HID 回调 + CGEventTap 同跑这条专用线程（见 start()）
+    private var engineRunLoop: CFRunLoop?              // 读写走 stateLock
+    private var repeatTimers: [String: Timer] = [:]    // 仅主线程访问（start/stopAutoRepeat 均 hop 到主线程）
 
     enum SwallowKey: Hashable {
         case keyboard(Int64)
         case consumer(Int32)
     }
-    private var swallowSet: Set<SwallowKey> = []
+    // 引用计数而非集合：同键 100ms 内二次按下时，上一次抬起的延迟摘除只抵掉
+    // 自己那一份登记，不会误摘新按下的登记。
+    private var swallowCounts: [SwallowKey: Int] = [:]
     private let swallowLock = NSLock()
 
-    private func addSwallow(_ k: SwallowKey)    { swallowLock.lock(); swallowSet.insert(k); swallowLock.unlock() }
-    private func removeSwallow(_ k: SwallowKey) { swallowLock.lock(); swallowSet.remove(k); swallowLock.unlock() }
+    private func addSwallow(_ k: SwallowKey) {
+        swallowLock.lock(); swallowCounts[k, default: 0] += 1; swallowLock.unlock()
+    }
+    private func removeSwallow(_ k: SwallowKey) {
+        swallowLock.lock()
+        if let c = swallowCounts[k] {
+            if c <= 1 { swallowCounts.removeValue(forKey: k) } else { swallowCounts[k] = c - 1 }
+        }
+        swallowLock.unlock()
+    }
     private func shouldSwallow(_ k: SwallowKey) -> Bool {
         swallowLock.lock(); defer { swallowLock.unlock() }
-        return swallowSet.contains(k)
+        return swallowCounts[k] != nil
     }
-    private func clearSwallows() { swallowLock.lock(); swallowSet.removeAll(); swallowLock.unlock() }
+    private func clearSwallows() {
+        swallowLock.lock(); swallowCounts.removeAll(); swallowLock.unlock()
+        greedyLock.lock(); greedyUntil = 0; greedyHeld.removeAll(); greedyLock.unlock()
+    }
+
+    // 全吞兜底：遥控器一有按键动作就开一个极短窗，窗口内吞掉一切非自家事件，
+    // 覆盖认不出 keycode 的冷门键；这类键按住期间保持贪吞（greedyHeld），
+    // 否则长按时系统合成的 auto-repeat 会在短窗过期后漏出。
+    private var greedyUntil: CFAbsoluteTime = 0
+    private var greedyHeld: Set<UInt64> = []   // 按住中的"无精确 keycode"键（usageKey）
+    private let greedyLock = NSLock()
+    // 自动收录去抖（仅引擎线程访问）：任何非噪声按下都更新，影子 usage 与真键
+    // 同一次按下、几乎同时上报，永远落进 0.3s 内被挡住（含真键已识别的后续按下）。
+    private var lastAnyDownAt: CFAbsoluteTime = 0
+    private func armGreedy(ms: Double) {
+        greedyLock.lock()
+        greedyUntil = max(greedyUntil, CFAbsoluteTimeGetCurrent() + ms / 1000.0)
+        greedyLock.unlock()
+    }
+    private func setGreedyHold(usageKey: UInt64, down: Bool) {
+        greedyLock.lock()
+        if down {
+            greedyHeld.insert(usageKey)
+        } else {
+            greedyHeld.remove(usageKey)
+            greedyUntil = max(greedyUntil, CFAbsoluteTimeGetCurrent() + 0.1)  // 收口抬起残留
+        }
+        greedyLock.unlock()
+    }
+    private func inGreedyWindow() -> Bool {
+        greedyLock.lock(); defer { greedyLock.unlock() }
+        return !greedyHeld.isEmpty || CFAbsoluteTimeGetCurrent() < greedyUntil
+    }
 
     private func swallowKey(for button: RemoteButton) -> SwallowKey? {
-        switch button.passthrough {
+        return swallowKey(forPassthrough: button.passthrough)
+    }
+
+    private func swallowKey(forPassthrough pt: PassthroughKind) -> SwallowKey? {
+        switch pt {
         case .keyboard(let kc): return .keyboard(Int64(kc))
         case .consumer(let kt): return .consumer(kt)
         case .none:             return nil
         }
+    }
+
+    /// keydown 时登记吞键，keyup 时 100ms 延迟摘除（吞掉系统"按起"与 auto-repeat 残留）。
+    private func applySwallow(_ sk: SwallowKey, isDown: Bool) {
+        vhLog("swallow \(isDown ? "+1" : "-1(100ms)") \(sk)")
+        if isDown { addSwallow(sk) } else { removeSwallowLater(sk) }
+    }
+
+    private func removeSwallowLater(_ sk: SwallowKey) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.removeSwallow(sk)
+        }
+    }
+
+    /// 登记吞键（与"执行 chord"解耦）。在引擎线程同步执行——与 tap 同线程串行，
+    /// 保证"先登记、后消费"，不受主线程忙碌影响。
+    /// - 全吞开启：能算出 keycode/consumer 的键走精确计数（低误伤）；推不出的键
+    ///   按住期间保持贪吞（greedyHeld，防长按 auto-repeat 漏出）；40ms 短窗盖伴生影子事件。
+    /// - 全吞关闭：退回旧行为，仅吞"已启用且已绑定"的已知键；键在按住期间被删除时
+    ///   抬起仍无条件补一次摘除（引用计数下多摘是 no-op），防 swallow 残留永久吞真键盘。
+    private func captureSwallow(usagePage: UInt32, usage: UInt32, isDown: Bool,
+                                known: RemoteButton?, cfg: RemoteConfig.EngineSnapshot) {
+        guard cfg.captureAllKeys else {
+            if let b = known {
+                let m = cfg.mappings[b.id] ?? Mapping()
+                if m.enabled, !m.keys.isEmpty, let sk = swallowKey(for: b) {
+                    applySwallow(sk, isDown: isDown)
+                }
+            } else if !isDown,
+                      let sk = swallowKey(forPassthrough: inferPassthrough(usagePage: usagePage,
+                                                                           usage: usage)) {
+                removeSwallowLater(sk)
+            }
+            return
+        }
+        let pt = known?.passthrough ?? inferPassthrough(usagePage: usagePage, usage: usage)
+        if let sk = swallowKey(forPassthrough: pt) {
+            applySwallow(sk, isDown: isDown)
+        } else if isRealButtonUsage(usagePage: usagePage, usage: usage) {
+            // 只有"像真实按键"的 usage 参与按住贪吞；垃圾影子 usage（如 0x07:0xFFFFFFFF）
+            // 可能只发 down 不发 up，进 greedyHeld 会永久吞掉整台键盘。
+            setGreedyHold(usageKey: UInt64(usagePage) << 32 | UInt64(usage), down: isDown)
+        }
+        armGreedy(ms: 40)
     }
 
     @discardableResult
@@ -965,8 +1192,6 @@ final class RemoteEngine: ObservableObject {
             let me = Unmanaged<RemoteEngine>.fromOpaque(ctx).takeUnretainedValue()
             me.onDeviceRemoved(device)
         }, selfPtr)
-        IOHIDManagerScheduleWithRunLoop(m, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-
         // 不 seize（self-signed app 拿不到 driverkit entitlement）。普通 open + CGEventTap 吞咽。
         let r = IOHIDManagerOpen(m, IOOptionBits(kIOHIDOptionsTypeNone))
         if r != kIOReturnSuccess {
@@ -975,10 +1200,34 @@ final class RemoteEngine: ObservableObject {
                 self?.lastError = "IOHIDManagerOpen 返回 \(hex)。请确认遥控器已插入、并且「输入监听」权限给到了 VibeHub。"
             }
             NSLog("RemoteEngine: IOHIDManagerOpen failed: \(hex)")
-            IOHIDManagerUnscheduleFromRunLoop(m, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
             return false
         }
-        if !installEventTap() {
+
+        // HID 回调与 CGEventTap 同跑一条专用后台线程：
+        // ① 都不受主线程 SwiftUI 布局阻塞（按键零延迟）；
+        // ② 单线程串行保证"HID 回调先登记吞键、tap 后消费系统事件"的顺序，
+        //    主线程再忙也不会漏吞（登记与消费不再跨线程竞速）。
+        let sem = DispatchSemaphore(value: 0)
+        var tapInstalled = false
+        let t = Thread { [weak self] in
+            guard let self else { sem.signal(); return }
+            IOHIDManagerScheduleWithRunLoop(m, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+            tapInstalled = self.installEventTapOnCurrentRunLoop()
+            self.stateLock.lock()
+            self.engineRunLoop = CFRunLoopGetCurrent()
+            self.stateLock.unlock()
+            sem.signal()
+            while !Thread.current.isCancelled {
+                CFRunLoopRunInMode(.defaultMode, 0.3, false)
+            }
+        }
+        t.name = "com.xiabill.VibeHub.engine"
+        t.qualityOfService = .userInteractive
+        engineThread = t
+        t.start()
+        sem.wait()   // 等 schedule + tap 装好再返回，tapInstalled 经信号量同步后安全可读
+
+        if !tapInstalled {
             DispatchQueue.main.async { [weak self] in
                 self?.lastError = "已启动 HID 监听，但 CGEventTap 安装失败 —— 多半「辅助功能」权限未授予。Home/Back/Voice/Menu 仍可工作；方向键/Vol/Mute 的映射会与系统行为叠加。请到「系统设置 → 隐私与安全性 → 辅助功能」打开 VibeHub，重启 App。"
             }
@@ -987,11 +1236,13 @@ final class RemoteEngine: ObservableObject {
         }
         manager = m
         isRunning = true
+        vhLog(String(format: "engine START target=0x%04X:0x%04X tap=%@",
+                     cfg.targetVID, cfg.targetPID, tapInstalled ? "ok" : "FAIL"))
         return true
     }
 
-    private func installEventTap() -> Bool {
-        if eventTap != nil { return true }
+    /// 在当前线程的 runloop 上创建并挂载 CGEventTap（仅引擎线程调用）。
+    private func installEventTapOnCurrentRunLoop() -> Bool {
         // keyDown / keyUp（10/11）+ NSSystemDefined（14）
         let mask: CGEventMask = (1 << 10) | (1 << 11) | (1 << 14)
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
@@ -1008,51 +1259,85 @@ final class RemoteEngine: ObservableObject {
             userInfo: selfPtr
         ) else { return false }
         let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-        CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+        stateLock.lock()
         eventTap = tap
         tapRunLoopSource = src
+        stateLock.unlock()
         return true
     }
 
     private func handleTap(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: true) }
+            vhLog("tap DISABLED by system (\(type.rawValue))，re-enabling")
+            // eventTap 加锁快照：stop()/restart() 在主线程置 nil 并释放，裸读会撞上 UB
+            stateLock.lock(); let tap = eventTap; stateLock.unlock()
+            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return Unmanaged.passUnretained(event)
         }
         // 自家事件直接放行（防止"OK→Enter 把自己也吞了"那类自吞 bug）
         if event.getIntegerValueField(.eventSourceUserData) == VH_EVENT_MAGIC {
+            if type == .keyDown || type == .keyUp {
+                vhLog("tap pass-own \(type == .keyDown ? "dn" : "up") kc=\(event.getIntegerValueField(.keyboardEventKeycode))")
+            }
             return Unmanaged.passUnretained(event)
+        }
+        // 全吞兜底：遥控器刚有按键动作，短窗内吞掉一切非自家事件（覆盖认不出 keycode 的键）
+        if inGreedyWindow(), type == .keyDown || type == .keyUp || type.rawValue == 14 {
+            vhLog("tap greedy-swallow type=\(type.rawValue) kc=\(event.getIntegerValueField(.keyboardEventKeycode))")
+            return nil
         }
         if type == .keyDown || type == .keyUp {
             let kc = event.getIntegerValueField(.keyboardEventKeycode)
-            if shouldSwallow(.keyboard(kc)) { return nil }
+            if shouldSwallow(.keyboard(kc)) {
+                vhLog("tap swallow \(type == .keyDown ? "dn" : "up") kc=\(kc)")
+                return nil
+            }
         } else if type.rawValue == 14 {
             guard let nsEvent = NSEvent(cgEvent: event), nsEvent.subtype.rawValue == 8 else {
                 return Unmanaged.passUnretained(event)
             }
             let keyType = Int32((nsEvent.data1 & 0xFFFF0000) >> 16)
-            if shouldSwallow(.consumer(keyType)) { return nil }
+            if shouldSwallow(.consumer(keyType)) {
+                vhLog("tap swallow consumer kt=\(keyType)")
+                return nil
+            }
         }
         return Unmanaged.passUnretained(event)
     }
 
     func stop() {
         guard isRunning else { return }
+        vhLog("engine STOP")
         stopAllAutoRepeats()
         clearSwallows()
         stopLearning()
         pressedButtonIds.removeAll()
-        if let tap = eventTap { CGEvent.tapEnable(tap: tap, enable: false) }
-        if let src = tapRunLoopSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .commonModes) }
-        eventTap = nil
-        tapRunLoopSource = nil
-        if let m = manager {
-            IOHIDManagerClose(m, IOOptionBits(kIOHIDOptionsTypeNone))
-            IOHIDManagerUnscheduleFromRunLoop(m, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+
+        stateLock.lock()
+        let tap = eventTap; let src = tapRunLoopSource; let rl = engineRunLoop
+        eventTap = nil; tapRunLoopSource = nil; engineRunLoop = nil
+        stateLock.unlock()
+        if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
+        let m = manager
+        // unschedule/invalidate 送回引擎线程自己的 runloop 执行（跨线程卸载不安全），
+        // 随后 cancel 让线程在 ≤0.3s 内自然退出。
+        if let rl {
+            CFRunLoopPerformBlock(rl, CFRunLoopMode.commonModes.rawValue) {
+                if let m {
+                    IOHIDManagerUnscheduleFromRunLoop(m, CFRunLoopGetCurrent(),
+                                                      CFRunLoopMode.defaultMode.rawValue)
+                }
+                if let src { CFRunLoopSourceInvalidate(src) }
+            }
+            CFRunLoopWakeUp(rl)
         }
+        engineThread?.cancel()
+        engineThread = nil
+        if let m { IOHIDManagerClose(m, IOOptionBits(kIOHIDOptionsTypeNone)) }
         manager = nil
-        openedDevices.removeAll()
+        stateLock.lock(); openedDevices.removeAll(); stateLock.unlock()
         DispatchQueue.main.async { [weak self] in self?.deviceConnected = false }
         isRunning = false
     }
@@ -1066,8 +1351,10 @@ final class RemoteEngine: ObservableObject {
         if wasRunning { _ = start() }
     }
 
+    // 设备匹配/移除回调在引擎线程（IOHIDManager schedule 在引擎 runloop）。
     private func onDeviceMatched(_ device: IOHIDDevice) {
-        openedDevices.insert(device)
+        vhLog("device MATCHED")
+        stateLock.lock(); openedDevices.insert(device); stateLock.unlock()
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
         IOHIDDeviceRegisterInputValueCallback(device, { ctx, _, _, value in
             guard let ctx else { return }
@@ -1078,24 +1365,28 @@ final class RemoteEngine: ObservableObject {
     }
 
     private func onDeviceRemoved(_ device: IOHIDDevice) {
+        vhLog("device REMOVED")
+        stateLock.lock()
         openedDevices.remove(device)
-        // 接收器被拔掉时 key-up 永远不来，repeat Timer 会无限发 chord。HID 回调在主
-        // runloop，repeatTimers 只在主线程访问，直接停掉所有 auto-repeat。
-        stopAllAutoRepeats()
-        // 同理：isDown 时加进 swallowSet 的条目等不到 key-up 的延迟摘除，
-        // 不清掉会永久吞真实键盘的同键码事件（与 stop() 的配对做法一致）。
+        let empty = openedDevices.isEmpty
+        stateLock.unlock()
+        // 接收器被拔掉时 key-up 永远不来：swallow 登记等不到抬起的延迟摘除（带锁直接清）；
+        // repeat Timer 会无限发 chord（timers 在主线程，hop 过去停）。
         clearSwallows()
-        pressedButtonIds.removeAll()   // 拔出时清空按下高亮，防残留（HID 回调在主 runloop）
         DispatchQueue.main.async { [weak self] in
-            self?.deviceConnected = !(self?.openedDevices.isEmpty ?? true)
+            guard let self else { return }
+            self.stopAllAutoRepeats()
+            self.pressedButtonIds.removeAll()
+            self.deviceConnected = !empty
         }
     }
 
-    // HID 回调在主 runloop（IOHIDManagerScheduleWithRunLoop main），@Published 更新安全。
+    // 学习态控制只在主线程调用（UI）；isLearning 供 UI 绑定，learnArmed 是引擎线程读的镜像。
     func startLearning() {
         learnedUsage = nil
         learnDuplicate = nil
         isLearning = true
+        learnArmed = true
         armLearnTimeout()
     }
 
@@ -1109,74 +1400,121 @@ final class RemoteEngine: ObservableObject {
 
     func stopLearning() {
         isLearning = false
+        learnArmed = false
         learnDuplicate = nil
         learnTimer?.invalidate()
         learnTimer = nil
     }
 
+    // HID 输入回调在引擎线程：swallow/greedy 同步登记（与 tap 同线程，天然先于事件
+    // 消费）；@Published / RemoteConfig 写入一律 hop 主线程。
     private func handleInputValue(_ value: IOHIDValue) {
         let element = IOHIDValueGetElement(value)
         let usagePage = IOHIDElementGetUsagePage(element)
         let usage = IOHIDElementGetUsage(element)
-        let intValue = IOHIDValueGetIntegerValue(value)
-        let isDown = (intValue != 0)
+        let isDown = (IOHIDValueGetIntegerValue(value) != 0)
 
         // 噪声：键盘页 reserved/rollover(<0x04) 与修饰键(0xE0-0xE7)、usage 0。这些不回显也不学习。
         let isNoise = usage == 0
             || (usagePage == 0x07 && (usage < 0x04 || (usage >= 0xE0 && usage <= 0xE7)))
-        let known = remoteButton(usagePage: usagePage, usage: usage)
+        let cfg = RemoteConfig.shared.engineSnapshot
+        let known = remoteButton(usagePage: usagePage, usage: usage, custom: cfg.customButtons)
 
-        // 回显与按下高亮：无论是否在列表 / 是否学习态都更新 lastHIDEvent（已知给 label，未知给 nil）；
-        // pressedButtonIds 只对已知按键维护。
-        if isDown && !isNoise {
-            lastHIDEvent = LastHIDEvent(usagePage: usagePage, usage: usage, buttonLabel: known?.label)
+        // 自动收录去抖：判定要在更新钟之前算；任何非噪声按下（含已识别键）都更新钟，
+        // 这样影子 usage 无论跟在第几次按下后面，都落进 0.3s 内被挡住。
+        let now = CFAbsoluteTimeGetCurrent()
+        let debounceOK = now - lastAnyDownAt > 0.3
+        if isDown && !isNoise { lastAnyDownAt = now }
+
+        if !isNoise {
+            vhLog(String(format: "hid %@ 0x%02X:0x%03X known=%@ panel=%d learn=%d",
+                         isDown ? "dn" : "up", usagePage, usage,
+                         known?.id ?? "-", panelVisible ? 1 : 0, learnArmed ? 1 : 0))
         }
+
+        // 按下高亮：仅对已知按键维护
         if let button = known {
-            if isDown { pressedButtonIds.insert(button.id) } else { pressedButtonIds.remove(button.id) }
+            let id = button.id
+            DispatchQueue.main.async { [weak self] in
+                if isDown { self?.pressedButtonIds.insert(id) } else { self?.pressedButtonIds.remove(id) }
+            }
         }
 
         // 学习态只拦截按下(value!=0)：key-up 必须放行到正常 dispatch，
-        // 否则学习前按住的键抬起被吞，auto-repeat 停不下来、swallowSet 残留。
-        if isLearning, isDown {
+        // 否则学习前按住的键抬起被吞，auto-repeat 停不下来、swallow 残留。
+        if learnArmed, isDown {
             if isNoise { return }
-            if known != nil {                    // 命中已存在按键 → 提示重复，保持学习态并重置超时
-                learnDuplicate = known?.label
-                armLearnTimeout()
+            if let dup = known?.label {          // 命中已存在按键 → 提示重复，保持学习态并重置超时
+                DispatchQueue.main.async { [weak self] in
+                    self?.learnDuplicate = dup
+                    self?.armLearnTimeout()
+                }
                 return
             }
-            learnDuplicate = nil
-            learnedUsage = LearnedUsage(page: usagePage, usage: usage)
-            stopLearning()
+            learnArmed = false   // 引擎侧立刻解除，防同一次按键的第二个 usage 又被捕获
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.learnDuplicate = nil
+                self.learnedUsage = LearnedUsage(page: usagePage, usage: usage)
+                self.stopLearning()
+            }
             return  // 学习态下不 dispatch
         }
+        // 登记吞键（与"执行 chord"解耦）：全吞模式下含未映射 / 未识别的键
+        if !isNoise {
+            captureSwallow(usagePage: usagePage, usage: usage, isDown: isDown,
+                           known: known, cfg: cfg)
+        }
+        // 面板打开时，未识别的新按键按下即自动收录，随后用户在列表里改名 + 配功能。
+        // 白名单挡掉复合设备的影子 usage，去抖挡掉同一次按键的多 element 上报。
+        if known == nil, isDown, debounceOK, panelVisible,
+           isRealButtonUsage(usagePage: usagePage, usage: usage) {
+            let hex = String(format: "0x%02X:0x%02X", usagePage, usage)
+            DispatchQueue.main.async {
+                RemoteConfig.shared.addCustomButton(label: "新按键 \(hex)",
+                                                    usagePage: usagePage, usage: usage)
+            }
+            return
+        }
         guard let button = known else { return }
-        dispatch(button: button, isDown: isDown)
+        dispatch(button: button, isDown: isDown, cfg: cfg)
     }
 
-    private func dispatch(button: RemoteButton, isDown: Bool) {
-        let cfg = RemoteConfig.shared
+    private func dispatch(button: RemoteButton, isDown: Bool, cfg: RemoteConfig.EngineSnapshot) {
         let mapping = cfg.mappings[button.id] ?? Mapping()
-        guard mapping.enabled, !mapping.keys.isEmpty else { return }
-        if let sk = swallowKey(for: button) {
-            if isDown {
-                addSwallow(sk)
-            } else {
-                let key = sk
-                // 100ms 延迟摘除，确保系统的"按起"事件（以及 auto-repeat 残留）都被吞掉
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                    self?.removeSwallow(key)
-                }
-            }
+        guard mapping.enabled, !mapping.keys.isEmpty else {
+            vhLog("dispatch \(button.id) \(isDown ? "dn" : "up") skip: enabled=\(mapping.enabled) keys=\(mapping.keys.count)")
+            return
         }
+        vhLog("dispatch \(button.id) \(isDown ? "dn" : "up") mode=\(mapping.mode.rawValue) keys=\(mapping.keys.joined(separator: "+"))")
         if isDown {
             // 面板打开时：swallow 已处理（吞掉 OK→Enter 等原生事件），但不执行绑定，
             // 否则切窗/Enter 会抢焦点、把 transient popover 自动关掉、打断输名字。
-            if panelVisible { return }
-            postChordDownAsync(keyIds: mapping.keys)
-            postChordUpAsync(keyIds: mapping.keys)
-            startAutoRepeat(buttonId: button.id, keys: mapping.keys)
+            if panelVisible { vhLog("dispatch \(button.id) skip: panelVisible"); return }
+            if mapping.mode == .holdToggle {
+                // 按住模式：chord 跟随物理按键——按下压住、抬起才松开
+                // （Typeless 按住说话这类场景；不参与 auto-repeat）
+                vhLog("chord hold-down \(mapping.keys.joined(separator: "+"))")
+                postChordDownAsync(keyIds: mapping.keys)
+            } else {
+                vhLog("chord tap \(mapping.keys.joined(separator: "+")) hold=\(cfg.tapHoldMs)ms")
+                postChordDownAsync(keyIds: mapping.keys)
+                // 停留 tapHoldMs 再抬起：12ms 机器点按会被 Typeless 等程序当误触丢弃
+                let id = button.id, keys = mapping.keys
+                DispatchQueue.main.asyncAfter(deadline: .now() + Double(cfg.tapHoldMs) / 1000.0) {
+                    postChordUpAsync(keyIds: keys)
+                }
+                DispatchQueue.main.async { [weak self] in self?.startAutoRepeat(buttonId: id, keys: keys) }
+            }
         } else {
-            stopAutoRepeat(buttonId: button.id)  // 抬起始终停 repeat（含面板打开前已启动的）
+            if mapping.mode == .holdToggle {
+                // 面板开着按下被跳过时，这里会补发一个多余的 chord up——无害（up 幂等）
+                vhLog("chord hold-up \(mapping.keys.joined(separator: "+"))")
+                postChordUpAsync(keyIds: mapping.keys)
+            }
+            let id = button.id
+            // 抬起始终停 repeat（含面板打开前已启动的）；down/up 依次入主队列，顺序有保证
+            DispatchQueue.main.async { [weak self] in self?.stopAutoRepeat(buttonId: id) }
         }
     }
 
@@ -1205,6 +1543,233 @@ final class RemoteEngine: ObservableObject {
     private func stopAllAutoRepeats() {
         for (_, t) in repeatTimers { t.invalidate() }
         repeatTimers.removeAll()
+    }
+}
+
+// MARK: - 共享：系统麦克风输入监测（当前输入设备 + 按需电平表）
+
+/// 一个可选作录音测试目标的输入设备（含 CoreAudio 设备 ID + 名称 + UID）。
+struct InputDevice: Identifiable, Hashable {
+    let id: AudioDeviceID
+    let name: String
+    let uid: String
+    let manufacturer: String   // 遥控器接收器音频侧名叫 "Mic Device"，厂商却是 "XING WEI 2.4G USB"——名字认不出，靠厂商字段兜底
+}
+
+/// 只读展示"系统默认输入设备"名称/UID（纯 CoreAudio 属性，不开麦、不需权限），
+/// 枚举全部输入设备供选择，并提供按需的麦克风电平测试（点一下才开麦，超时/停止
+/// 自动关，把对遥控器自带 mic 断流特性的影响降到最低）。
+final class AudioInputMonitor: ObservableObject {
+    static let shared = AudioInputMonitor()
+
+    @Published private(set) var inputName: String = "—"
+    @Published private(set) var inputUID: String = ""
+    @Published private(set) var isTesting = false
+    @Published private(set) var level: Float = 0      // 0...1 归一化电平
+    @Published private(set) var testError: String?
+    @Published private(set) var hasRecording = false  // 上次录音可回放
+    @Published private(set) var isPlaying = false
+    @Published private(set) var inputDevices: [InputDevice] = []   // 全部可用输入设备（供多设备选择）
+    @Published var selectedDeviceID: AudioDeviceID? = nil          // nil = 跟随系统默认
+    @Published private(set) var defaultDeviceID: AudioDeviceID = 0 // 当前系统默认输入设备 ID
+
+    private var engine: AVAudioEngine?
+    private var timeoutItem: DispatchWorkItem?
+    private var recFile: AVAudioFile?                 // 录音测试同时落盘，供回放判断音质
+    private var player: AVAudioPlayer?
+    private var playGen = 0
+    private let recURL = FileManager.default.temporaryDirectory
+        .appendingPathComponent("vibehub-mic-test.caf")
+    private var defaultInputAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    private var devicesAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDevices,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+
+    private init() {
+        refresh()
+        // 系统默认输入设备变化时实时刷新显示
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &defaultInputAddr, DispatchQueue.main
+        ) { [weak self] _, _ in self?.refresh() }
+        // 设备插拔（列表变化）时实时刷新可选设备列表
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &devicesAddr, DispatchQueue.main
+        ) { [weak self] _, _ in self?.refresh() }
+    }
+
+    /// 刷新"当前系统默认输入设备"名称 + UID，并枚举全部可用输入设备。纯只读属性，不激活麦克风。
+    func refresh() {
+        var devID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let st = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                            &defaultInputAddr, 0, nil, &size, &devID)
+        if st == noErr, devID != 0 {
+            defaultDeviceID = devID
+            inputName = deviceString(devID, kAudioObjectPropertyName) ?? "未知设备"
+            inputUID  = deviceString(devID, kAudioDevicePropertyDeviceUID) ?? ""
+        } else {
+            defaultDeviceID = 0
+            inputName = "（无输入设备）"; inputUID = ""
+        }
+        refreshInputDevices()
+    }
+
+    /// 枚举系统全部音频设备，保留有输入通道的设备（可作录音测试目标），按名称排序。
+    private func refreshInputDevices() {
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject),
+                                             &devicesAddr, 0, nil, &size) == noErr, size > 0 else {
+            inputDevices = []; selectedDeviceID = nil; return
+        }
+        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+        var ids = [AudioDeviceID](repeating: 0, count: count)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                         &devicesAddr, 0, nil, &size, &ids) == noErr else {
+            inputDevices = []; selectedDeviceID = nil; return
+        }
+        var result: [InputDevice] = []
+        for id in ids where inputChannelCount(id) > 0 {
+            let name = deviceString(id, kAudioObjectPropertyName) ?? "未知设备"
+            let uid  = deviceString(id, kAudioDevicePropertyDeviceUID) ?? ""
+            let manufacturer = deviceString(id, kAudioObjectPropertyManufacturer) ?? ""
+            result.append(InputDevice(id: id, name: name, uid: uid, manufacturer: manufacturer))
+        }
+        inputDevices = result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        // 选中的设备若已拔掉，退回跟随系统默认
+        if let sel = selectedDeviceID, !inputDevices.contains(where: { $0.id == sel }) {
+            selectedDeviceID = nil
+        }
+    }
+
+    /// 读设备输入 scope 的流配置，返回输入通道总数（0 表示纯输出设备）。
+    private func inputChannelCount(_ dev: AudioDeviceID) -> Int {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(dev, &addr, 0, nil, &size) == noErr, size > 0 else { return 0 }
+        let ptr = UnsafeMutableRawPointer.allocate(byteCount: Int(size),
+                                                    alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { ptr.deallocate() }
+        guard AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, ptr) == noErr else { return 0 }
+        let bufList = UnsafeMutableAudioBufferListPointer(ptr.assumingMemoryBound(to: AudioBufferList.self))
+        return bufList.reduce(0) { $0 + Int($1.mNumberChannels) }
+    }
+
+    private func deviceString(_ dev: AudioDeviceID, _ selector: AudioObjectPropertySelector) -> String? {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var value: CFString? = nil
+        var size = UInt32(MemoryLayout<CFString?>.size)
+        guard AudioObjectGetPropertyData(dev, &addr, 0, nil, &size, &value) == noErr else { return nil }
+        return value as String?
+    }
+
+    /// 按需开麦测电平：先请求麦克风权限，授权后启动 AVAudioEngine 读 RMS。
+    func startTest() {
+        guard !isTesting else { return }
+        testError = nil
+        AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if granted { self.beginEngine() }
+                else { self.testError = "麦克风权限被拒绝：系统设置 → 隐私与安全性 → 麦克风 开启 VibeHub" }
+            }
+        }
+    }
+
+    private func beginEngine() {
+        guard engine == nil else { return }   // 连点「测试」：权限回调异步窗口内可能进两次
+        refresh()
+        let eng = AVAudioEngine()
+        let input = eng.inputNode
+        // 绑定所选麦克风（nil 时用系统默认）：把设备写进 input 的 AudioUnit，
+        // 让引擎采到指定设备而非系统默认，实现多设备分别测试。
+        let target = selectedDeviceID ?? defaultDeviceID
+        if target != 0, let au = input.audioUnit {
+            var dev = target
+            let st = AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice,
+                                          kAudioUnitScope_Global, 0, &dev,
+                                          UInt32(MemoryLayout<AudioDeviceID>.size))
+            if st != noErr {
+                testError = "无法绑定所选麦克风（错误 \(st)），已回退系统默认输入"
+                // 不 return：继续用默认设备录，比直接失败友好
+            }
+        }
+        let fmt = input.inputFormat(forBus: 0)
+        guard fmt.sampleRate > 0, fmt.channelCount > 0 else {
+            testError = "无法读取输入设备格式（设备可能未就绪或被占用）"; return
+        }
+        recFile = try? AVAudioFile(forWriting: recURL, settings: fmt.settings)
+        input.installTap(onBus: 0, bufferSize: 1024, format: fmt) { [weak self] buffer, _ in
+            try? self?.recFile?.write(from: buffer)
+            guard let ch = buffer.floatChannelData?[0] else { return }
+            let n = Int(buffer.frameLength)
+            if n == 0 { return }
+            var sum: Float = 0
+            for i in 0..<n { let s = ch[i]; sum += s * s }
+            let rms = sqrtf(sum / Float(n))
+            let db = 20 * log10f(max(rms, 1e-7))
+            let norm = max(0, min(1, (db + 60) / 60))   // -60dB..0dB → 0..1
+            DispatchQueue.main.async { self?.level = norm }
+        }
+        do {
+            try eng.start()
+            engine = eng
+            isTesting = true
+            // 15 秒自动停（遥控器自带 mic 撑不了太久，测试用够了）
+            let item = DispatchWorkItem { [weak self] in self?.stopTest() }
+            timeoutItem = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: item)
+        } catch {
+            testError = "启动麦克风失败：\(error.localizedDescription)"
+        }
+    }
+
+    func stopTest() {
+        timeoutItem?.cancel(); timeoutItem = nil
+        if let eng = engine {
+            eng.inputNode.removeTap(onBus: 0)
+            eng.stop()
+        }
+        engine = nil
+        if recFile != nil {
+            recFile = nil                      // 关闭文件（AVAudioFile 无显式 close，置 nil 落盘）
+            hasRecording = true
+        }
+        isTesting = false
+        level = 0
+    }
+
+    // —— 回放（判断录音音质）——
+
+    func play() {
+        guard !isTesting, hasRecording, !isPlaying,
+              let p = try? AVAudioPlayer(contentsOf: recURL) else { return }
+        player = p
+        p.play()
+        isPlaying = true
+        playGen += 1
+        let gen = playGen
+        // ponytail: asyncAfter 估时收尾而非 delegate，误差 ±0.2s 无感；要精确改 AVAudioPlayerDelegate
+        DispatchQueue.main.asyncAfter(deadline: .now() + p.duration + 0.2) { [weak self] in
+            guard let self, self.playGen == gen else { return }
+            self.stopPlayback()
+        }
+    }
+
+    func stopPlayback() {
+        playGen += 1
+        player?.stop()
+        player = nil
+        isPlaying = false
     }
 }
 
@@ -1278,19 +1843,38 @@ struct KeyPickerRow: View {
     let label: String
     let labelWidth: CGFloat
     @Binding var mapping: Mapping
-    let showModePicker: Bool  // AirPods=true（点按/按住），Remote=false
+    let showModePicker: Bool  // 点按/按住 模式菜单（AirPods=切换语义，Remote=跟随物理按住）
     let rowId: String
     @Binding var recordingRowId: String?
     var isPressed: Bool = false   // Remote：该按键此刻被按下 → 行背景闪 accent
+    var labelBinding: Binding<String>? = nil   // 非 nil 时 label 位渲染可编辑名称框（自定义按键用）
 
     @StateObject private var recorder = KeyRecorder()
+    @State private var editName = ""
+    @FocusState private var nameFocused: Bool
 
     private var isRecording: Bool { recordingRowId == rowId }
+
+    /// 名称提交：仅在回车 / 失焦时写回 config，避免每字符改 @Published 触发全量重算把框顶掉。
+    private func commitName() {
+        guard let lb = labelBinding, lb.wrappedValue != editName else { return }
+        lb.wrappedValue = editName
+    }
 
     var body: some View {
         HStack(spacing: 6) {
             Toggle("", isOn: $mapping.enabled).labelsHidden().controlSize(.small)
-            Text(label).frame(width: labelWidth, alignment: .leading).font(.system(size: 12))
+            if labelBinding != nil {
+                TextField("名称", text: $editName)
+                    .textFieldStyle(.roundedBorder).controlSize(.small)
+                    .frame(width: labelWidth)
+                    .focused($nameFocused)
+                    .onSubmit { commitName(); nameFocused = false }   // 回车确认后收焦点，高亮框消失
+                    .onChange(of: nameFocused) { focused in if !focused { commitName() } }
+                    .onAppear { editName = labelBinding?.wrappedValue ?? "" }
+            } else {
+                Text(label).frame(width: labelWidth, alignment: .leading).font(.system(size: 12))
+            }
             Spacer(minLength: 4)
             if isRecording {
                 Text("按下快捷键…")
@@ -1324,6 +1908,7 @@ struct KeyPickerRow: View {
         .onDisappear {
             if isRecording { recordingRowId = nil }  // popover 关闭强制取消
             recorder.stop()
+            commitName()   // 关面板时保存未提交的改名
         }
     }
 
@@ -1386,6 +1971,12 @@ struct KeyPickerRow: View {
             }
             Divider()
             Button("追加按键") { mapping.keys.append("lopt") }
+            if !mapping.keys.isEmpty {
+                Button("清除绑定", role: .destructive) {
+                    mapping.keys = []
+                    mapping.enabled = false
+                }
+            }
         } label: {
             Image(systemName: "ellipsis")
         }
@@ -1612,10 +2203,12 @@ struct AirPodsTabView: View {
 struct RemoteTabView: View {
     @ObservedObject var config = RemoteConfig.shared
     @ObservedObject var engine = RemoteEngine.shared
+    @ObservedObject var audio = AudioInputMonitor.shared
     @Binding var recordingRowId: String?
     @State private var detectedDevices: [DetectedDevice] = []
     @State private var learnName: String = ""
     @State private var actionMsg: String?
+    @State private var confirmClearCustom = false
 
     private let groupDpad   = ["up", "down", "left", "right", "ok", "menu"]
     private let groupSystem = ["home", "back", "voice"]
@@ -1649,6 +2242,7 @@ struct RemoteTabView: View {
             PermissionCard(specs: [.accessibility, .inputMonitoring])
             bindingsCard
             deviceCard
+            micCard
             advancedCard
         }
         .padding(12)
@@ -1743,7 +2337,7 @@ struct RemoteTabView: View {
         Group {
             if let b = remoteButtons.first(where: { $0.id == id }) {
                 KeyPickerRow(label: b.label, labelWidth: 68,
-                    mapping: config.binding(for: id), showModePicker: false,
+                    mapping: config.binding(for: id), showModePicker: true,
                     rowId: "rm-\(id)", recordingRowId: $recordingRowId,
                     isPressed: engine.pressedButtonIds.contains(id))
             }
@@ -1769,15 +2363,33 @@ struct RemoteTabView: View {
                     .font(.caption2).foregroundColor(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            lastKeyRow
             Divider()
-            Text("自定义按键").font(.caption2).foregroundColor(.secondary)
+            HStack(spacing: 4) {
+                Text("自定义按键").font(.caption2).foregroundColor(.secondary)
+                Spacer()
+                if !config.customButtons.isEmpty {
+                    Button(role: .destructive) { confirmClearCustom = true } label: {
+                        Label("清空", systemImage: "trash")
+                    }.buttonStyle(.borderless).font(.caption)
+                }
+            }
+            Text("面板打开时按键不执行绑定（配置模式）；按遥控器上未收录的键会自动加到这里并标「新发现」，改名、绑定即可。")
+                .font(.caption2).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             ForEach(config.customButtons) { c in
                 HStack(spacing: 4) {
-                    KeyPickerRow(label: c.label, labelWidth: 68,
-                        mapping: config.binding(for: c.id), showModePicker: false,
+                    KeyPickerRow(label: "", labelWidth: 92,
+                        mapping: config.binding(for: c.id), showModePicker: true,
                         rowId: "rm-\(c.id)", recordingRowId: $recordingRowId,
-                        isPressed: engine.pressedButtonIds.contains(c.id))
+                        isPressed: engine.pressedButtonIds.contains(c.id),
+                        labelBinding: config.customLabelBinding(c.id))
+                    if config.newButtonIds.contains(c.id) {
+                        Text("新发现").font(.caption2)
+                            .padding(.horizontal, 4).padding(.vertical, 1)
+                            .background(Color.orange.opacity(0.18))
+                            .foregroundColor(.orange).cornerRadius(3)
+                            .help("刚自动收录的按键：改个名字并绑定功能")
+                    }
                     Button { config.removeCustomButton(c.id) } label: {
                         Image(systemName: "trash")
                     }
@@ -1787,30 +2399,11 @@ struct RemoteTabView: View {
             learnControls
         }
         .vhCard()
-    }
-
-    /// 最近按键回显 + 常驻提示：已知给 label+usage，未知给橙色发现提示，无事件给灰字。
-    @ViewBuilder private var lastKeyRow: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(alignment: .top, spacing: 4) {
-                Text("最近按键").font(.caption2).foregroundColor(.secondary)
-                if let e = engine.lastHIDEvent {
-                    if let lbl = e.buttonLabel {
-                        Text(String(format: "%@ (0x%02X:0x%02X)", lbl, e.usagePage, e.usage))
-                            .font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
-                    } else {
-                        Text(String(format: "未知按键 0x%02X:0x%02X — 可通过下方「学习新按键」添加",
-                                    e.usagePage, e.usage))
-                            .font(.caption2).foregroundColor(.orange)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                } else {
-                    Text("按一下遥控器试试").font(.caption2).foregroundColor(.secondary)
-                }
-                Spacer(minLength: 0)
+        .confirmationDialog("清空所有自定义按键？", isPresented: $confirmClearCustom, titleVisibility: .visible) {
+            Button("删除全部 \(config.customButtons.count) 个", role: .destructive) {
+                config.clearAllCustomButtons()
             }
-            Text("面板打开时按键不执行绑定（配置模式）")
-                .font(.caption2).foregroundColor(.secondary)
+            Button("取消", role: .cancel) {}
         }
     }
 
@@ -1900,7 +2493,39 @@ struct RemoteTabView: View {
     // —— 高级卡 ——
 
     private var advancedCard: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text("完全接管遥控器").font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Toggle("", isOn: $config.captureAllKeys)
+                        .toggleStyle(.switch).labelsHidden().controlSize(.mini)
+                }
+                Text(config.captureAllKeys
+                     ? "遥控器所有按键（含未映射 / 未识别）的系统原生行为都被吞掉，只走你的映射。"
+                     : "仅吞掉已绑定按键的系统行为；未映射的键仍会触发系统。")
+                    .font(.caption2).foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if config.captureAllKeys {
+                    Text("注意：按遥控器后约 40ms 内主键盘按下的键可能被一并吞掉（极少同时发生）；语音键触发的系统听写走私有路径无法拦截。")
+                        .font(.caption2).foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Divider()
+            HStack(spacing: 6) {
+                Text("点按停留").font(.caption).frame(width: 56, alignment: .leading)
+                Slider(value: Binding(
+                    get: { Double(config.tapHoldMs) },
+                    set: { config.tapHoldMs = Int($0) }
+                ), in: 30...300, step: 10)
+                Text("\(config.tapHoldMs) ms")
+                    .font(.caption).monospacedDigit().frame(width: 56, alignment: .trailing)
+            }
+            Text("点按模式按键从按下到抬起的停留时长。太短会被部分程序当误触（Typeless 需 ≥100ms）。")
+                .font(.caption2).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Divider()
             HStack {
                 Text("长按自动重复").font(.subheadline.weight(.semibold))
                 Spacer()
@@ -1932,11 +2557,153 @@ struct RemoteTabView: View {
         }
         .vhCard()
     }
+
+    // —— 麦克风输入卡 ——
+
+    private var micCard: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("麦克风输入").font(.subheadline.weight(.semibold))
+                Spacer()
+                if audio.isTesting {
+                    Button("停止") { audio.stopTest() }
+                        .buttonStyle(.borderless).font(.caption)
+                } else if audio.isPlaying {
+                    Button("停止回放") { audio.stopPlayback() }
+                        .buttonStyle(.borderless).font(.caption)
+                } else {
+                    if audio.hasRecording {
+                        Button { audio.play() } label: {
+                            Label("回放", systemImage: "play.circle")
+                        }.buttonStyle(.borderless).font(.caption)
+                    }
+                    Button {
+                        scanDevicesAsync()   // 刷新 HID 名，供是否遥控器匹配
+                        audio.startTest()
+                    } label: {
+                        Label("录音测试", systemImage: "record.circle")
+                    }.buttonStyle(.borderless).font(.caption)
+                }
+            }
+            // 可选输入设备列表：点选要测试的麦克风，不选则跟随系统默认
+            ForEach(audio.inputDevices) { dev in
+                Button {
+                    // 再点已选中项 → 取消选择，退回跟随系统默认
+                    audio.selectedDeviceID = (audio.selectedDeviceID == dev.id) ? nil : dev.id
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: isSelected(dev) ? "checkmark.circle.fill" : "circle")
+                            .font(.caption)
+                            .foregroundColor(isSelected(dev) ? .accentColor : .secondary)
+                        Text(dev.name)
+                            .font(.system(size: 11, design: .monospaced))
+                            .lineLimit(1).truncationMode(.middle)
+                            .foregroundColor(.primary)
+                        if dev.id == audio.defaultDeviceID {
+                            Text("系统默认").font(.caption2)
+                                .padding(.horizontal, 5).padding(.vertical, 1)
+                                .background(Color.secondary.opacity(0.18))
+                                .foregroundColor(.secondary).cornerRadius(3)
+                        }
+                        if looksLikeRemote(dev) {
+                            Text("遥控器").font(.caption2)
+                                .padding(.horizontal, 5).padding(.vertical, 1)
+                                .background(Color.green.opacity(0.18))
+                                .foregroundColor(.green).cornerRadius(3)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+            .disabled(audio.isTesting || audio.isPlaying)
+            Text("点选要测试的麦克风；不选则跟随系统默认。")
+                .font(.caption2).foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            // 系统默认输入是遥控器自带 mic 时警告：接收器传音频流会饿死按键通道，录音期间遥控器按键全无响应
+            if let def = audio.inputDevices.first(where: { $0.id == audio.defaultDeviceID }),
+               looksLikeRemote(def) {
+                Text("⚠️ 系统默认输入是遥控器自带 mic：录音期间接收器忙于传音频，遥控器按键会无响应（且 16kHz 音质差）。语音输入工具（Typeless 等）请改用其它麦克风，遥控器只当按键用。")
+                    .font(.caption2).foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            // 电平表（仅测试期间）
+            if audio.isTesting {
+                VStack(alignment: .leading, spacing: 3) {
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            RoundedRectangle(cornerRadius: 3).fill(Color.secondary.opacity(0.15))
+                            RoundedRectangle(cornerRadius: 3)
+                                .fill(audio.level > 0.02 ? Color.green : Color.secondary.opacity(0.4))
+                                .frame(width: max(2, geo.size.width * CGFloat(audio.level)))
+                        }
+                    }
+                    .frame(height: 8)
+                    Text("对着遥控器说话，绿条应随声音跳动（15 秒后自动停，停止后可回放听音质）")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+            }
+            if let err = audio.testError {
+                Text(err).font(.caption2).foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .vhCard()
+        .onAppear { audio.refresh() }
+        .onDisappear { audio.stopTest() }
+    }
+
+    /// 跟随默认时，默认设备显示为选中态。
+    private func isSelected(_ dev: InputDevice) -> Bool {
+        audio.selectedDeviceID == dev.id
+            || (audio.selectedDeviceID == nil && dev.id == audio.defaultDeviceID)
+    }
+
+    /// best-effort 判断"某输入设备是不是当前目标遥控器"。
+    /// 先看设备 UID 里是否同时含目标 VID+PID 的 hex（强信号），再退到设备名/厂商名模糊匹配。
+    // ponytail: 名称启发式，跨设备命名不一致可能漏判；漏判时只是不显示徽标，不会误接管。
+    private func looksLikeRemote(_ dev: InputDevice) -> Bool {
+        let uid = dev.uid.lowercased()
+        if !uid.isEmpty {
+            let vidHex = String(format: "%04x", config.targetVID)
+            let pidHex = String(format: "%04x", config.targetPID)
+            if uid.contains(vidHex) && uid.contains(pidHex) { return true }
+        }
+        let target = detectedDevices.first {
+            $0.vendorId == config.targetVID && $0.productId == config.targetPID
+        }
+        // 设备侧的名字和厂商字段任一，与 HID 侧的 product/manufacturer 任一互 contains 即判定。
+        // 因为音频侧和 HID 侧对同一接收器的命名各写各的（音频名 "Mic Device"、厂商 "XING WEI 2.4G USB"），
+        // 只有把两侧的两个字段两两对撞才认得出。
+        for devCand in [dev.name, dev.manufacturer] {
+            let inNorm = normalizeName(devCand)
+            guard !inNorm.isEmpty else { continue }
+            for cand in [target?.product, target?.manufacturer].compactMap({ $0 }) {
+                let c = normalizeName(cand)
+                if c.count >= 3 && (inNorm.contains(c) || c.contains(inNorm)) { return true }
+            }
+        }
+        return false
+    }
+
+    private func normalizeName(_ s: String) -> String {
+        s.lowercased().filter { $0.isLetter || $0.isNumber }
+    }
 }
 
 // MARK: - UI: 主面板（segmented picker + ZStack，Tab 切换不重建视图树）
 
+/// 上报面板内容自然高度；AppDelegate 据此命令式设置 popover.contentSize。
+/// （高度协商不进 AutoLayout：约束驱动的自适应在 macOS 27 会递归爆栈，见 AppDelegate 注释）
+private struct ContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 struct ContentView: View {
+    var heightChanged: (CGFloat) -> Void = { _ in }
     @ObservedObject var loginItem = LaunchAtLogin.shared
     @State private var selectedTab: String = "airpods"
     @State private var recordingRowId: String? = nil   // 全局唯一录制行；切 Tab 时清空
@@ -1946,6 +2713,20 @@ struct ContentView: View {
     }
 
     var body: some View {
+        // 整体套 ScrollView：内容拿"无限高度提案"算自然高度（与窗口高度无循环依赖），
+        // 测量结果经 heightChanged 命令式设给 popover；窗口不够高时自然获得滚动。
+        ScrollView(.vertical, showsIndicators: false) {
+            inner
+                .background(GeometryReader { g in
+                    Color.clear.preference(key: ContentHeightKey.self, value: g.size.height)
+                })
+        }
+        .frame(width: 360)
+        .onPreferenceChange(ContentHeightKey.self) { heightChanged($0) }
+        .background(Color(NSColor.windowBackgroundColor))
+    }
+
+    private var inner: some View {
         VStack(spacing: 0) {
             Picker("", selection: $selectedTab) {
                 Text("AirPods").tag("airpods")
@@ -1998,7 +2779,6 @@ struct ContentView: View {
             }
         }
         .frame(width: 360)
-        .background(Color(NSColor.windowBackgroundColor))
     }
 }
 
@@ -2059,9 +2839,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         // 预热：先把 host 挂到一个屏外隐藏 window 里强制 SwiftUI 渲染整棵树，
         // 然后再交给 popover。否则 SwiftUI 只在视图真正进入 window 时才 build body，
         // 首次点击图标时要现场建整棵树。
-        // sizingOptions=.preferredContentSize 让 host 把 SwiftUI 理想高度同步给 popover（面板自适应高度）。
-        let host = NSHostingController(rootView: ContentView())
-        host.sizingOptions = [.preferredContentSize]
+        // sizingOptions=[]：禁用 NSHostingController 的自动尺寸约束。约束驱动的
+        // "popover 高度跟随内容"在 macOS 27 的 CoreAutoLayout 上会递归爆栈（三次
+        // 崩溃同栈：NSISEngine _flushPendingRemovals）。高度改为 SwiftUI 侧测量
+        // 自然高度后，经 heightChanged 回调在这里命令式 setContentSize——约束系统
+        // 永远只解一个固定尺寸，超屏时 ContentView 的外层 ScrollView 自然接管滚动。
+        let host = NSHostingController(rootView: ContentView(heightChanged: { [weak self] h in
+            guard let self, h > 0 else { return }
+            let cap = ((NSScreen.main?.visibleFrame.height) ?? 900) - 120
+            let newH = min(max(h, 240), cap).rounded()
+            DispatchQueue.main.async {
+                if abs(self.popover.contentSize.height - newH) > 0.5 {
+                    self.popover.contentSize = NSSize(width: 360, height: newH)
+                }
+            }
+        }))
+        host.sizingOptions = []
+        popover.contentSize = NSSize(width: 360, height: 640)   // 首帧兜底，测量到位后校正
         let warmup = NSWindow(
             contentRect: NSRect(x: -50000, y: -50000, width: 360, height: 900),
             styleMask: [.borderless], backing: .buffered, defer: false)
@@ -2143,6 +2937,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // transient 自动关 / performClose 都会回调这里：面板不可见后恢复按键执行绑定。
     func popoverDidClose(_ notification: Notification) {
         RemoteEngine.shared.panelVisible = false
+        AudioInputMonitor.shared.stopTest()       // 面板关了没人看电平，别让麦克风橙点继续亮
+        AudioInputMonitor.shared.stopPlayback()
     }
 
     private func showContextMenu(from button: NSStatusBarButton, event: NSEvent) {
