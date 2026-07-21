@@ -298,6 +298,9 @@ private let NX_KEYTYPE_NEXT:       Int32 = 17
 private let NX_KEYTYPE_FAST:       Int32 = 19
 private let NX_KEYTYPE_PREVIOUS:   Int32 = 18
 
+// MARK: - 共享：诊断日志（统一日志，Console/log show 可拉；只记遥控器链路与吞键决策，不记用户正常键盘输入）
+func vhLog(_ s: String) { NSLog("VH| %@", s) }
+
 // MARK: - 共享：自家事件 magic（让 tap 识别自己 post 的事件，避免自吞）
 
 private let VH_EVENT_MAGIC: Int64 = 0x56484D50  // "VHMP" ASCII
@@ -1064,6 +1067,7 @@ final class RemoteEngine: ObservableObject {
 
     /// keydown 时登记吞键，keyup 时 100ms 延迟摘除（吞掉系统"按起"与 auto-repeat 残留）。
     private func applySwallow(_ sk: SwallowKey, isDown: Bool) {
+        vhLog("swallow \(isDown ? "+1" : "-1(100ms)") \(sk)")
         if isDown { addSwallow(sk) } else { removeSwallowLater(sk) }
     }
 
@@ -1193,6 +1197,8 @@ final class RemoteEngine: ObservableObject {
         }
         manager = m
         isRunning = true
+        vhLog(String(format: "engine START target=0x%04X:0x%04X tap=%@",
+                     cfg.targetVID, cfg.targetPID, tapInstalled ? "ok" : "FAIL"))
         return true
     }
 
@@ -1225,6 +1231,7 @@ final class RemoteEngine: ObservableObject {
 
     private func handleTap(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            vhLog("tap DISABLED by system (\(type.rawValue))，re-enabling")
             // eventTap 加锁快照：stop()/restart() 在主线程置 nil 并释放，裸读会撞上 UB
             stateLock.lock(); let tap = eventTap; stateLock.unlock()
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
@@ -1232,27 +1239,38 @@ final class RemoteEngine: ObservableObject {
         }
         // 自家事件直接放行（防止"OK→Enter 把自己也吞了"那类自吞 bug）
         if event.getIntegerValueField(.eventSourceUserData) == VH_EVENT_MAGIC {
+            if type == .keyDown || type == .keyUp {
+                vhLog("tap pass-own \(type == .keyDown ? "dn" : "up") kc=\(event.getIntegerValueField(.keyboardEventKeycode))")
+            }
             return Unmanaged.passUnretained(event)
         }
         // 全吞兜底：遥控器刚有按键动作，短窗内吞掉一切非自家事件（覆盖认不出 keycode 的键）
         if inGreedyWindow(), type == .keyDown || type == .keyUp || type.rawValue == 14 {
+            vhLog("tap greedy-swallow type=\(type.rawValue) kc=\(event.getIntegerValueField(.keyboardEventKeycode))")
             return nil
         }
         if type == .keyDown || type == .keyUp {
             let kc = event.getIntegerValueField(.keyboardEventKeycode)
-            if shouldSwallow(.keyboard(kc)) { return nil }
+            if shouldSwallow(.keyboard(kc)) {
+                vhLog("tap swallow \(type == .keyDown ? "dn" : "up") kc=\(kc)")
+                return nil
+            }
         } else if type.rawValue == 14 {
             guard let nsEvent = NSEvent(cgEvent: event), nsEvent.subtype.rawValue == 8 else {
                 return Unmanaged.passUnretained(event)
             }
             let keyType = Int32((nsEvent.data1 & 0xFFFF0000) >> 16)
-            if shouldSwallow(.consumer(keyType)) { return nil }
+            if shouldSwallow(.consumer(keyType)) {
+                vhLog("tap swallow consumer kt=\(keyType)")
+                return nil
+            }
         }
         return Unmanaged.passUnretained(event)
     }
 
     func stop() {
         guard isRunning else { return }
+        vhLog("engine STOP")
         stopAllAutoRepeats()
         clearSwallows()
         stopLearning()
@@ -1296,6 +1314,7 @@ final class RemoteEngine: ObservableObject {
 
     // 设备匹配/移除回调在引擎线程（IOHIDManager schedule 在引擎 runloop）。
     private func onDeviceMatched(_ device: IOHIDDevice) {
+        vhLog("device MATCHED")
         stateLock.lock(); openedDevices.insert(device); stateLock.unlock()
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
         IOHIDDeviceRegisterInputValueCallback(device, { ctx, _, _, value in
@@ -1307,6 +1326,7 @@ final class RemoteEngine: ObservableObject {
     }
 
     private func onDeviceRemoved(_ device: IOHIDDevice) {
+        vhLog("device REMOVED")
         stateLock.lock()
         openedDevices.remove(device)
         let empty = openedDevices.isEmpty
@@ -1367,6 +1387,12 @@ final class RemoteEngine: ObservableObject {
         let debounceOK = now - lastAnyDownAt > 0.3
         if isDown && !isNoise { lastAnyDownAt = now }
 
+        if !isNoise {
+            vhLog(String(format: "hid %@ 0x%02X:0x%03X known=%@ panel=%d learn=%d",
+                         isDown ? "dn" : "up", usagePage, usage,
+                         known?.id ?? "-", panelVisible ? 1 : 0, learnArmed ? 1 : 0))
+        }
+
         // 按下高亮：仅对已知按键维护
         if let button = known {
             let id = button.id
@@ -1417,16 +1443,22 @@ final class RemoteEngine: ObservableObject {
 
     private func dispatch(button: RemoteButton, isDown: Bool, cfg: RemoteConfig.EngineSnapshot) {
         let mapping = cfg.mappings[button.id] ?? Mapping()
-        guard mapping.enabled, !mapping.keys.isEmpty else { return }
+        guard mapping.enabled, !mapping.keys.isEmpty else {
+            vhLog("dispatch \(button.id) \(isDown ? "dn" : "up") skip: enabled=\(mapping.enabled) keys=\(mapping.keys.count)")
+            return
+        }
+        vhLog("dispatch \(button.id) \(isDown ? "dn" : "up") mode=\(mapping.mode.rawValue) keys=\(mapping.keys.joined(separator: "+"))")
         if isDown {
             // 面板打开时：swallow 已处理（吞掉 OK→Enter 等原生事件），但不执行绑定，
             // 否则切窗/Enter 会抢焦点、把 transient popover 自动关掉、打断输名字。
-            if panelVisible { return }
+            if panelVisible { vhLog("dispatch \(button.id) skip: panelVisible"); return }
             if mapping.mode == .holdToggle {
                 // 按住模式：chord 跟随物理按键——按下压住、抬起才松开
                 // （Typeless 按住说话这类场景；不参与 auto-repeat）
+                vhLog("chord hold-down \(mapping.keys.joined(separator: "+"))")
                 postChordDownAsync(keyIds: mapping.keys)
             } else {
+                vhLog("chord tap \(mapping.keys.joined(separator: "+"))")
                 postChordDownAsync(keyIds: mapping.keys)
                 postChordUpAsync(keyIds: mapping.keys)
                 let id = button.id, keys = mapping.keys
@@ -1435,6 +1467,7 @@ final class RemoteEngine: ObservableObject {
         } else {
             if mapping.mode == .holdToggle {
                 // 面板开着按下被跳过时，这里会补发一个多余的 chord up——无害（up 幂等）
+                vhLog("chord hold-up \(mapping.keys.joined(separator: "+"))")
                 postChordUpAsync(keyIds: mapping.keys)
             }
             let id = button.id
